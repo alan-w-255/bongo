@@ -307,6 +307,9 @@ The player owns an independent view, so it does not disturb the
 mode-line visualizer and both can run at the same time."
   (when (and bongo-player-show-visualizer
              (fboundp 'bongo-visualizer-render-frame))
+    ;; Load the C module here too: otherwise the player buffer would fall
+    ;; back to the pure-Lisp bars until the global visualizer is enabled.
+    (bongo-visualizer--load-module)
     (setq bongo-player--visualizer
           (bongo-visualizer--new-view 'buffer))
     (bongo-visualizer--setup-canvas bongo-player--visualizer)
