@@ -86,7 +86,7 @@
   "Stop playback and turn the visualizer off."
   (interactive)
   (ignore-errors (bongo-stop))
-  (bongo-visualizer-mode -1)
+  (bongo-visualizer-mode-line-mode -1)
   (message "Bongo visualizer demo stopped"))
 
 ;;;###autoload
@@ -98,7 +98,7 @@
         bongo-visualizer-display 'mode-line
         bongo-visualizer-style 0
         bongo-visualizer-fps 30)
-  (bongo-visualizer-mode 1)
+  (bongo-visualizer-mode-line-mode 1)
   (bongo-visualizer-demo-play)
   (global-set-key (kbd "C-c v") #'bongo-visualizer-demo-cycle-style)
   (global-set-key (kbd "C-c t") #'bongo-visualizer-cycle-theme)

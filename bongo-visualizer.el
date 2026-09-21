@@ -32,7 +32,7 @@
 ;; Usage:
 ;;   M-x bongo-visualizer-build-module RET   (once, compiles the C module)
 ;;   (require 'bongo-visualizer)
-;;   (bongo-visualizer-mode 1)
+;;   (bongo-visualizer-mode-line-mode 1)
 ;;
 ;;   M-x bongo-visualizer-cycle-theme RET    (switch colour themes)
 ;;
@@ -447,7 +447,7 @@ The order of the components is documented in
 
 ;;;; Canvas state
 
-(defvar bongo-visualizer-mode)  ; defined by `define-minor-mode' below
+(defvar bongo-visualizer-mode-line-mode)  ; defined below
 
 (cl-defstruct (bongo-visualizer--view
                (:constructor bongo-visualizer--make-view)
@@ -474,7 +474,7 @@ visualizer do not share anything but the decoded audio."
 (defvar bongo-visualizer--views nil
   "List of visualizer views that currently own a canvas.")
 (defvar bongo-visualizer--mode-line-view nil
-  "The view shown by `bongo-visualizer-mode', or nil.")
+  "The view shown by `bongo-visualizer-mode-line-mode', or nil.")
 (defvar bongo-visualizer--timer nil
   "Repeating timer driving the animation of the mode-line view.")
 
@@ -920,8 +920,8 @@ Interactively, prompt for one of `bongo-visualizer-themes'."
 
 (defun bongo-visualizer-build-module ()
   "Compile the C renderer module with `make'.
-Run this once before enabling `bongo-visualizer-mode', or after editing
-`bongo-visualizer-module.c'."
+Run this once before enabling `bongo-visualizer-mode-line-mode', or
+after editing `bongo-visualizer-module.c'."
   (interactive)
   (let ((default-directory (bongo-visualizer--source-directory)))
     (compile (format "make -f %s"
@@ -934,7 +934,7 @@ Run this once before enabling `bongo-visualizer-mode', or after editing
 Run this after changing the font size or the mode line height."
   (interactive)
   (let ((view bongo-visualizer--mode-line-view))
-    (if (not (and bongo-visualizer-mode view))
+    (if (not (and bongo-visualizer-mode-line-mode view))
         (message "Bongo visualizer is not enabled")
       (bongo-visualizer--setup-canvas view)
       (bongo-visualizer--refresh-view view)
@@ -1017,8 +1017,9 @@ Run this after changing the font size or the mode line height."
   "Render one visualizer frame into VIEW.
 VIEW defaults to `bongo-visualizer--mode-line-view'.  Unlike
 `bongo-visualizer--frame', this does not check
-`bongo-visualizer-mode', so a front end such as `bongo-player-mode'
-can drive its own view even when the visualizer's display is off."
+`bongo-visualizer-mode-line-mode', so a front end such as
+`bongo-player-mode' can drive its own view even when the visualizer's
+display is off."
   (let ((view (or view bongo-visualizer--mode-line-view)))
     (when (and view (bongo-visualizer--view-canvas view))
       ;; Notice a theme change made with `setq' and rebuild the canvas so
@@ -1034,7 +1035,7 @@ can drive its own view even when the visualizer's display is off."
 
 (defun bongo-visualizer--frame ()
   "Advance the animation by one frame."
-  (when bongo-visualizer-mode
+  (when bongo-visualizer-mode-line-mode
     (bongo-visualizer-render-frame bongo-visualizer--mode-line-view)))
 
 (defun bongo-visualizer--renderer ()
@@ -1079,7 +1080,7 @@ Lisp renderer while more than one view is active."
 
 (defun bongo-visualizer--sync-source (&rest _)
   "Restart the PCM decoder for the new track, if any."
-  (when (and bongo-visualizer-mode
+  (when (and bongo-visualizer-mode-line-mode
              (eq bongo-visualizer-source 'mpv)
              bongo-player)
     (let ((file (ignore-errors (bongo-player-file-name bongo-player))))
@@ -1097,7 +1098,7 @@ Lisp renderer while more than one view is active."
 (defun bongo-visualizer--mode-line ()
   "Return the mode line construct for the visualizer canvas."
   (let ((view bongo-visualizer--mode-line-view))
-    (when (and bongo-visualizer-mode view)
+    (when (and bongo-visualizer-mode-line-mode view)
       (let ((canvas (bongo-visualizer--view-canvas view)))
         (when canvas
           (propertize " " 'display canvas
@@ -1144,14 +1145,17 @@ Lisp renderer while more than one view is active."
                      (float (frame-char-height)))))))))))
 
 ;;;###autoload
-(define-minor-mode bongo-visualizer-mode
-  "Toggle the Bongo music visualizer.
+(define-minor-mode bongo-visualizer-mode-line-mode
+  "Toggle the Bongo mode-line music visualizer.
 With a prefix argument ARG, enable the mode if ARG is positive.
-This is a global minor mode; the visualizer follows whichever Bongo
-playlist buffer currently has an active player."
+This is a global minor mode; it drives the visualizer's own view,
+shown according to `bongo-visualizer-display' (in the mode line by
+default), and follows whichever Bongo playlist buffer currently has
+an active player.  The player buffer of `bongo-player-mode' draws
+its own, independent view."
   :global t
   :group 'bongo-visualizer
-  (if bongo-visualizer-mode
+  (if bongo-visualizer-mode-line-mode
       (progn
         (bongo-visualizer--load-module)
         (setq bongo-visualizer--mode-line-view
