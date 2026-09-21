@@ -929,9 +929,12 @@ Run this after changing the font size or the mode line height."
            (when (bongo-visualizer--module-theme-capable-p)
              (list bongo-visualizer--c-theme)))))
 
-(defun bongo-visualizer--frame ()
-  "Advance the animation by one frame."
-  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+(defun bongo-visualizer-render-frame ()
+  "Render one visualizer frame into `bongo-visualizer--canvas'.
+Unlike `bongo-visualizer--frame', this does not check
+`bongo-visualizer-mode', so a front end such as `bongo-player-mode'
+can drive the canvas even when the visualizer's own display is off."
+  (when bongo-visualizer--canvas
     ;; Notice a theme change made with `setq' and rebuild the canvas so
     ;; that the background and the Lisp gradient follow it too.
     (unless (eq bongo-visualizer-theme bongo-visualizer--current-theme)
@@ -940,6 +943,11 @@ Run this after changing the font size or the mode line height."
       (pcase (bongo-visualizer--renderer)
         ('module (bongo-visualizer--module-frame player))
         (_ (bongo-visualizer--frame-lisp player))))))
+
+(defun bongo-visualizer--frame ()
+  "Advance the animation by one frame."
+  (when bongo-visualizer-mode
+    (bongo-visualizer-render-frame)))
 
 (defun bongo-visualizer--renderer ()
   "Return the renderer to use: `module' or `lisp'."
