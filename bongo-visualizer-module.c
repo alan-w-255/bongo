@@ -23,7 +23,11 @@ Build:  make           (produces bongo-visualizer-module.dylib)
 Load:   (module-load "/path/to/bongo-visualizer-module.dylib")
 Call:   (bongo-vis-render CANVAS SAMPLES WIDTH HEIGHT TIME STYLE)
         SAMPLES is a vector of floats in [-1, 1]; STYLE is 0 (scope and
-        spectrum), 1 (scope only) or 2 (spectrum only).
+        spectrum), 1 (scope only) or 2 (spectrum only).  Optional
+        TRANSPARENT leaves the background transparent.  Optional THEME
+        is a flat float vector of colours, in the order documented in
+        `bongo-visualizer-themes'; without it a pink phosphor scheme is
+        used.
 */
 
 #include <emacs-module.h>
@@ -39,6 +43,38 @@ int plugin_is_GPL_compatible;
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* ------------------------------------------------------------------ */
+/* Colour themes.                                                      */
+
+/* The Lisp side passes a flat float vector whose components are, in
+   order, the fields of `bongo-visualizer-themes'.  Keeping the theme
+   data in Lisp means a user can add themes without touching C.  */
+enum
+{
+  TH_HUE0, TH_HUE1, TH_SAT0, TH_SAT1,
+  TH_ENV_R, TH_ENV_G, TH_ENV_B,
+  TH_PEAK_R, TH_PEAK_G, TH_PEAK_B,
+  TH_SCOPE_R, TH_SCOPE_G, TH_SCOPE_B,
+  TH_AXIS_R, TH_AXIS_G, TH_AXIS_B,
+  TH_BG_R, TH_BG_G, TH_BG_B,
+  TH_GRID_R, TH_GRID_G, TH_GRID_B,
+  TH_COUNT
+};
+
+/* The pink phosphor look, used when no theme vector is supplied.  */
+static void
+default_theme (double *th)
+{
+  th[TH_HUE0] = 0.94; th[TH_HUE1] = 0.85;
+  th[TH_SAT0] = 0.85; th[TH_SAT1] = 0.55;
+  th[TH_ENV_R] = 1.8;  th[TH_ENV_G] = 1.15; th[TH_ENV_B] = 1.55;
+  th[TH_PEAK_R] = 2.3; th[TH_PEAK_G] = 1.5; th[TH_PEAK_B] = 2.0;
+  th[TH_SCOPE_R] = 1.0; th[TH_SCOPE_G] = 0.28; th[TH_SCOPE_B] = 0.62;
+  th[TH_AXIS_R] = 0.32; th[TH_AXIS_G] = 0.08; th[TH_AXIS_B] = 0.18;
+  th[TH_BG_R] = 12; th[TH_BG_G] = 14; th[TH_BG_B] = 22;
+  th[TH_GRID_R] = 28; th[TH_GRID_G] = 32; th[TH_GRID_B] = 48;
+}
 
 /* ------------------------------------------------------------------ */
 /* Persistent scratch state (one visualizer, one canvas).              */
@@ -271,7 +307,8 @@ box_blur_3 (float *buf, float *scratch, int w, int h, int r)
 
 static void
 render (uint32_t *pixels, const double *samples, int nsamp,
-        double rate, double time, int style, bool transparent)
+        double rate, double time, int style, bool transparent,
+        const double *th)
 {
   const int w = W, h = H;
   const size_t npx = (size_t) w * h;
@@ -358,10 +395,13 @@ render (uint32_t *pixels, const double *samples, int nsamp,
         {
           double frac = (w > 1) ? (double) x / (w - 1) : 0.0;
           double r, g, b;
-          /* A pink phosphor: hot magenta at the low end fading to a
-             pale rose at the high end, with a slow shimmer.  */
-          hsv_to_rgb (0.94 - 0.09 * frac + 0.02 * sin (time * 0.25),
-                      0.85 - 0.30 * frac, 1.0, &r, &g, &b);
+          /* The theme sweeps its hue across the spectrum, from the
+             low end (left) to the high end (right), with a slow
+             shimmer.  */
+          double hue = th[TH_HUE0] + (th[TH_HUE1] - th[TH_HUE0]) * frac
+                       + 0.02 * sin (time * 0.25);
+          double sat = th[TH_SAT0] + (th[TH_SAT1] - th[TH_SAT0]) * frac;
+          hsv_to_rgb (hue, sat, 1.0, &r, &g, &b);
 
           double v = levels[x];
           double hh = v * maxh;
@@ -378,8 +418,10 @@ render (uint32_t *pixels, const double *samples, int nsamp,
           /* Bright envelope line on both edges.  */
           if (ih > 0)
             {
-              add_pixel (acc, x, mid + ih, 1.8, 1.15, 1.55, 0.85);
-              add_pixel (acc, x, mid - ih, 1.8, 1.15, 1.55, 0.85);
+              add_pixel (acc, x, mid + ih, th[TH_ENV_R], th[TH_ENV_G],
+                         th[TH_ENV_B], 0.85);
+              add_pixel (acc, x, mid - ih, th[TH_ENV_R], th[TH_ENV_G],
+                         th[TH_ENV_B], 0.85);
             }
           /* Falling peak caps, only when clearly above the bar.  */
           double pv = peaks[x];
@@ -387,8 +429,10 @@ render (uint32_t *pixels, const double *samples, int nsamp,
             {
               int py = mid + (int) (pv * maxh);
               int py2 = mid - (int) (pv * maxh);
-              add_pixel (acc, x, py, 2.3, 1.5, 2.0, 0.95);
-              add_pixel (acc, x, py2, 2.3, 1.5, 2.0, 0.95);
+              add_pixel (acc, x, py, th[TH_PEAK_R], th[TH_PEAK_G],
+                         th[TH_PEAK_B], 0.95);
+              add_pixel (acc, x, py2, th[TH_PEAK_R], th[TH_PEAK_G],
+                         th[TH_PEAK_B], 0.95);
             }
         }
     }
@@ -405,13 +449,15 @@ render (uint32_t *pixels, const double *samples, int nsamp,
           int y = mid - (int) (s * amp);
           y = clampi (y, 1, h - 2);
           if (prev_x >= 0)
-            draw_line (acc, prev_x, prev_y, x, y, 1.0, 0.28, 0.62, 0.9);
+            draw_line (acc, prev_x, prev_y, x, y,
+                       th[TH_SCOPE_R], th[TH_SCOPE_G], th[TH_SCOPE_B], 0.9);
           prev_x = x;
           prev_y = y;
         }
       /* Dim zero axis, as on a scope graticule.  */
       for (int x = 0; x < w; x++)
-        add_pixel (acc, x, mid, 0.32, 0.08, 0.18, 0.45);
+        add_pixel (acc, x, mid, th[TH_AXIS_R], th[TH_AXIS_G],
+                   th[TH_AXIS_B], 0.45);
     }
 
   /* ---- Bloom: blur a copy and add it back.  ---- */
@@ -427,12 +473,17 @@ render (uint32_t *pixels, const double *samples, int nsamp,
   int grid_y = h / 4;
   if (grid_x < 1) grid_x = 1;
   if (grid_y < 1) grid_y = 1;
+  double bgr = th[TH_BG_R] / 255.0;
+  double bgg = th[TH_BG_G] / 255.0;
+  double bgb = th[TH_BG_B] / 255.0;
+  double grr = th[TH_GRID_R] / 255.0;
+  double grg = th[TH_GRID_G] / 255.0;
+  double grb = th[TH_GRID_B] / 255.0;
   for (int y = 0; y < h; y++)
     {
       double dy = (h > 1) ? (2.0 * y / (h - 1) - 1.0) : 0.0;
-      double bg = 0.008 + 0.018 * (1.0 - (double) y / (h - 1));
       double scan = (y & 1) ? 0.93 : 1.0;
-      double gline = (y % grid_y == 0) ? 0.012 : 0.0;
+      double gline = (y % grid_y == 0) ? 1.0 : 0.0;
       for (int x = 0; x < w; x++)
         {
           size_t i = ((size_t) y * w + x) * 3;
@@ -462,10 +513,11 @@ render (uint32_t *pixels, const double *samples, int nsamp,
               double dx = (w > 1) ? (2.0 * x / (w - 1) - 1.0) : 0.0;
               double vig = 1.0 - 0.5 * (dx * dx + dy * dy);
               if (vig < 0.0) vig = 0.0;
-              double grid = gline + ((x % grid_x == 0) ? 0.012 : 0.0);
-              r = bg * 0.75 + grid * 0.60 + acc[i]     + bloom[i]     * style_glow;
-              g = bg * 0.50 + grid * 0.40 + acc[i + 1] + bloom[i + 1] * style_glow;
-              b = bg * 0.80 + grid * 0.55 + acc[i + 2] + bloom[i + 2] * style_glow;
+              double gcol = (x % grid_x == 0) ? 1.0 : 0.0;
+              double grid = (gline > 0.0 || gcol > 0.0) ? 1.0 : 0.0;
+              r = bgr + grr * 0.35 * grid + acc[i]     + bloom[i]     * style_glow;
+              g = bgg + grg * 0.35 * grid + acc[i + 1] + bloom[i + 1] * style_glow;
+              b = bgb + grb * 0.35 * grid + acc[i + 2] + bloom[i + 2] * style_glow;
               r *= vig * scan; g *= vig * scan; b *= vig * scan;
               A = 0xFF;
             }
@@ -505,6 +557,23 @@ Fbongo_vis_render (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
   if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
     return env->intern (env, "nil");
 
+  /* Optional colour theme, a flat vector of floats in the order
+     documented in `bongo-visualizer-themes'.  */
+  double th[TH_COUNT];
+  default_theme (th);
+  if (nargs > 8 && env->is_not_nil (env, args[8]))
+    {
+      ptrdiff_t tn = env->vec_size (env, args[8]);
+      if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
+        return env->intern (env, "nil");
+      if (tn > TH_COUNT)
+        tn = TH_COUNT;
+      for (ptrdiff_t i = 0; i < tn; i++)
+        th[i] = env->extract_float (env, env->vec_get (env, args[8], i));
+      if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
+        return env->intern (env, "nil");
+    }
+
   uint32_t *pixels = env->canvas_data (env, canvas);
   if (!pixels)
     return env->intern (env, "nil");
@@ -530,7 +599,7 @@ Fbongo_vis_render (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
   if (w <= 0 || h <= 0 || !ensure_state (w, h, n))
     return env->intern (env, "nil");
 
-  render (pixels, s, (int) nsamp, rate, time, style, transparent);
+  render (pixels, s, (int) nsamp, rate, time, style, transparent, th);
 
   emacs_value refresh = env->intern (env, "canvas-refresh");
   emacs_value refresh_args[2] = { canvas, env->intern (env, "nil") };
@@ -720,13 +789,15 @@ emacs_module_init (struct emacs_runtime *ert)
 {
   emacs_env *env = ert->get_environment (ert);
 
-  define (env, "bongo-vis-render", 6, 8, Fbongo_vis_render,
+  define (env, "bongo-vis-render", 6, 9, Fbongo_vis_render,
           "Render one visualizer frame into CANVAS.\n"
           "SAMPLES is a vector of floats in [-1, 1],\n"
           "WIDTH and HEIGHT are the canvas dimensions, RATE is the\n"
           "sample rate, TIME is the frame timestamp, and optional\n"
           "STYLE selects a look.  When TRANSPARENT is non-nil the\n"
-          "background is left transparent.");
+          "background is left transparent.  THEME, when given, is a\n"
+          "flat float vector of colours as documented in\n"
+          "`bongo-visualizer-themes'.");
   define (env, "bongo-vis-pixel", 4, 4, Fbongo_vis_pixel,
           "Return the ARGB pixel at X, Y in CANVAS of WIDTH (debug helper).\n"
           "\n(fn CANVAS X Y WIDTH)");

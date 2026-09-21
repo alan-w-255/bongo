@@ -17,6 +17,7 @@
 ;;
 ;; Keys:
 ;;   C-c v  cycle scope + spectrum, scope only, spectrum only
+;;   C-c t  cycle the colour theme
 ;;   C-c p  pause or resume playback
 ;;   C-c q  stop playback and turn the visualizer off
 
@@ -100,9 +101,10 @@
   (bongo-visualizer-mode 1)
   (bongo-visualizer-demo-play)
   (global-set-key (kbd "C-c v") #'bongo-visualizer-demo-cycle-style)
+  (global-set-key (kbd "C-c t") #'bongo-visualizer-cycle-theme)
   (global-set-key (kbd "C-c p") #'bongo-pause/resume)
   (global-set-key (kbd "C-c q") #'bongo-visualizer-demo-stop)
-  (message "Bongo visualizer demo: C-c v style, C-c p pause, C-c q stop"))
+  (message "Bongo visualizer demo: C-c v style, C-c t theme, C-c p pause, C-c q stop"))
 
 ;; Run immediately when loaded as a script, e.g. emacs -Q -l this-file.
 ;; Set BONGO_VISUALIZER_NO_AUTORUN in the environment to load the file

@@ -34,6 +34,8 @@
 ;;   (require 'bongo-visualizer)
 ;;   (bongo-visualizer-mode 1)
 ;;
+;;   M-x bongo-visualizer-cycle-theme RET    (switch colour themes)
+;;
 ;; The C renderer is a dynamic module; without it a slower pure-Lisp
 ;; renderer is used.
 ;;
@@ -49,6 +51,11 @@
 ;; player.  By default it is shown in the mode line of every buffer (see
 ;; `bongo-visualizer-display'); set that to `side-window' to put it in a
 ;; dedicated buffer at the bottom of the frame instead.
+;;
+;; The colours come from `bongo-visualizer-theme'; use
+;; `bongo-visualizer-cycle-theme' to step through the built-in themes or
+;; `bongo-visualizer-set-theme' to pick one by name.  Adding a theme is
+;; just a matter of pushing another entry onto `bongo-visualizer-themes'.
 
 ;;; Code:
 
@@ -263,24 +270,173 @@ R, G and B are clamped to 0..255; A defaults to fully opaque."
             (ash (funcall clamp g) 8)
             (funcall clamp b))))
 
-(defconst bongo-visualizer--background
-  (bongo-visualizer--argb 12 14 22)
-  "Background color of the canvas.")
+(defconst bongo-visualizer-themes
+  '((pink
+     :label "Pink phosphor"
+     :hue (0.94 0.85)
+     :sat (0.85 0.55)
+     :envelope (1.8 1.15 1.55)
+     :peak (2.3 1.5 2.0)
+     :scope (1.0 0.28 0.62)
+     :axis (0.32 0.08 0.18)
+     :background (12 14 22)
+     :grid (28 32 48)
+     :gradient ((30 4 26) (140 10 80) (225 60 145) (255 205 235))
+     :caps (250 215 240))
+    (green
+     :label "Green phosphor"
+     :hue (0.33 0.45)
+     :sat (0.90 0.55)
+     :envelope (0.85 1.85 1.05)
+     :peak (1.2 2.3 1.5)
+     :scope (0.25 1.0 0.42)
+     :axis (0.06 0.30 0.12)
+     :background (10 18 12)
+     :grid (24 44 28)
+     :gradient ((2 30 10) (10 120 40) (60 210 110) (200 255 215))
+     :caps (210 255 220))
+    (amber
+     :label "Amber CRT"
+     :hue (0.07 0.13)
+     :sat (0.95 0.60)
+     :envelope (1.95 1.35 0.6)
+     :peak (2.35 1.7 0.85)
+     :scope (1.0 0.58 0.10)
+     :axis (0.32 0.16 0.02)
+     :background (20 14 8)
+     :grid (46 32 14)
+     :gradient ((36 16 2) (140 70 6) (225 150 30) (255 235 180))
+     :caps (255 230 170))
+    (cyan
+     :label "Ice cyan"
+     :hue (0.50 0.62)
+     :sat (0.85 0.55)
+     :envelope (0.7 1.65 1.9)
+     :peak (0.9 1.95 2.3)
+     :scope (0.2 0.82 1.0)
+     :axis (0.05 0.22 0.30)
+     :background (8 16 22)
+     :grid (18 36 48)
+     :gradient ((2 26 34) (6 100 130) (40 190 220) (200 250 255))
+     :caps (205 250 255))
+    (blue
+     :label "Deep blue"
+     :hue (0.62 0.72)
+     :sat (0.90 0.60)
+     :envelope (0.6 0.95 2.0)
+     :peak (0.85 1.25 2.4)
+     :scope (0.3 0.5 1.0)
+     :axis (0.06 0.12 0.36)
+     :background (8 10 26)
+     :grid (20 26 56)
+     :gradient ((2 4 40) (10 30 140) (50 110 235) (190 220 255))
+     :caps (195 220 255))
+    (rainbow
+     :label "Rainbow spectrum"
+     :hue (0.0 0.85)
+     :sat (0.90 0.90)
+     :envelope (1.7 1.7 1.7)
+     :peak (2.3 2.3 2.3)
+     :scope (1.0 0.55 0.12)
+     :axis (0.22 0.22 0.24)
+     :background (10 10 14)
+     :grid (30 30 40)
+     :gradient ((60 0 120) (0 120 230) (0 200 90) (255 180 0))
+     :caps (255 255 255))
+    (mono
+     :label "Monochrome"
+     :hue (0.60 0.60)
+     :sat (0.0 0.0)
+     :envelope (1.8 1.85 2.0)
+     :peak (2.4 2.45 2.6)
+     :scope (0.9 0.93 1.0)
+     :axis (0.2 0.22 0.30)
+     :background (12 12 16)
+     :grid (34 34 44)
+     :gradient ((20 20 26) (90 92 105) (170 175 190) (245 248 255))
+     :caps (250 252 255)))
+  "Colour themes for the Bongo visualizer.
 
-(defconst bongo-visualizer--grid-color
-  (bongo-visualizer--argb 28 32 48)
-  "Color of the horizontal grid lines.")
+Each element has the form (ID . PLIST).  ID is a symbol naming the
+theme; the plist holds:
 
-(defconst bongo-visualizer--peak-color
-  (bongo-visualizer--argb 235 235 245)
-  "Color of the falling peak caps.")
+  :label       Human readable name.
+  :hue         (START END), HSV hue at the low and high ends of the
+               spectrum, both in 0..1.
+  :sat         (START END), the matching HSV saturations.
+  :envelope    HDR RGB of the bright spectrum edge (C module).
+  :peak        HDR RGB of the falling peak caps (C module).
+  :scope       HDR RGB of the oscilloscope trace (C module).
+  :axis        HDR RGB of the scope's zero axis (C module).
+  :background  RGB bytes of the opaque background.
+  :grid        RGB bytes of the graticule lines.
+  :gradient    RGB byte colours from the bottom of a bar to its top,
+               used by the pure-Lisp renderer.
+  :caps        RGB bytes of the pure-Lisp renderer's peak caps.
 
-(defun bongo-visualizer--vu-color (frac)
-  "Return an ARGB color for the classic VU gradient at FRAC (0..1).
-Zero is green (bottom), 0.5 yellow, 1.0 red (top)."
-  (if (< frac 0.5)
-      (bongo-visualizer--argb (* 510.0 frac) 255 0)
-    (bongo-visualizer--argb 255 (* 510.0 (- 1.0 frac)) 0)))
+The C module receives the first eight groups as a flat float vector;
+see `bongo-visualizer--theme-vector'.")
+
+(defcustom bongo-visualizer-theme 'pink
+  "Colour theme used by the visualizer.
+See `bongo-visualizer-themes' for the choices.  Prefer
+`bongo-visualizer-set-theme' or `bongo-visualizer-cycle-theme' to
+switch themes; `customize-set-variable' works as well.  Setting the
+value directly with `setq' takes effect on the next animation frame."
+  :type `(choice
+          ,@(mapcar (lambda (entry)
+                      `(const :tag ,(plist-get (cdr entry) :label)
+                              ,(car entry)))
+                    bongo-visualizer-themes)))
+
+(defun bongo-visualizer--theme (&optional theme)
+  "Return the plist describing THEME, defaulting to the selected theme.
+Unknown names fall back to `pink'."
+  (or (cdr (assq (or theme bongo-visualizer-theme) bongo-visualizer-themes))
+      (cdr (assq 'pink bongo-visualizer-themes))))
+
+(defun bongo-visualizer--theme-argb (key &optional alpha)
+  "Pack the current theme's RGB color stored under KEY into ARGB32."
+  (let ((rgb (plist-get (bongo-visualizer--theme) key)))
+    (bongo-visualizer--argb (nth 0 rgb) (nth 1 rgb) (nth 2 rgb) alpha)))
+
+(defun bongo-visualizer--blend-rgb (a b frac)
+  "Blend RGB byte colors A and B by FRAC (0 gives A, 1 gives B)."
+  (bongo-visualizer--argb
+   (+ (* (nth 0 a) (- 1.0 frac)) (* (nth 0 b) frac))
+   (+ (* (nth 1 a) (- 1.0 frac)) (* (nth 1 b) frac))
+   (+ (* (nth 2 a) (- 1.0 frac)) (* (nth 2 b) frac))))
+
+(defun bongo-visualizer--theme-gradient-vector (height)
+  "Build a HEIGHT-long ARGB gradient from the current theme's stops."
+  (let* ((stops (plist-get (bongo-visualizer--theme) :gradient))
+         (n (length stops)))
+    (vconcat
+     (cl-loop for dy below height
+              for frac = (if (> height 1) (/ (float dy) (1- height)) 0.0)
+              for pos = (* frac (1- n))
+              for i = (min (1- n) (floor pos))
+              for j = (min (1- n) (1+ i))
+              collect (bongo-visualizer--blend-rgb
+                       (nth i stops) (nth j stops)
+                       (if (= i j) 0.0 (- pos i)))))))
+
+(defun bongo-visualizer--theme-vector (&optional theme)
+  "Return the flat float vector that the C renderer uses for THEME.
+The order of the components is documented in
+`bongo-visualizer-themes'."
+  (let* ((plist (bongo-visualizer--theme theme))
+         (hue (plist-get plist :hue))
+         (sat (plist-get plist :sat)))
+    (vconcat
+     (mapcar #'float
+             (append hue sat
+                     (plist-get plist :envelope)
+                     (plist-get plist :peak)
+                     (plist-get plist :scope)
+                     (plist-get plist :axis)
+                     (plist-get plist :background)
+                     (plist-get plist :grid))))))
 
 
 ;;;; Canvas state
@@ -306,7 +462,13 @@ Zero is green (bottom), 0.5 yellow, 1.0 red (top)."
 (defvar bongo-visualizer--peaks nil
   "List of falling peak positions.")
 (defvar bongo-visualizer--gradient nil
-  "Vector mapping a row offset to its VU gradient color.")
+  "Vector mapping a row offset to its bar gradient color.")
+(defvar bongo-visualizer--peak-color nil
+  "Color of the falling peak caps in the pure-Lisp renderer.")
+(defvar bongo-visualizer--c-theme nil
+  "Flat float vector describing the current theme for the C module.")
+(defvar bongo-visualizer--current-theme nil
+  "Theme the canvas was built for; used to notice theme changes.")
 
 
 ;;;; PCM source
@@ -544,10 +706,10 @@ the bins we actually display."
                    bongo-visualizer-height))
          (background-color (if bongo-visualizer-transparent-background
                                (bongo-visualizer--argb 0 0 0 1)
-                             bongo-visualizer--background))
+                             (bongo-visualizer--theme-argb :background)))
          (grid-color (if bongo-visualizer-transparent-background
                          (bongo-visualizer--argb 0 0 0 1)
-                       bongo-visualizer--grid-color))
+                       (bongo-visualizer--theme-argb :grid)))
          (background (make-vector (* width height)
                                   background-color)))
     ;; A couple of horizontal grid lines for depth.
@@ -559,9 +721,10 @@ the bins we actually display."
           bongo-visualizer--height height
           bongo-visualizer--background-vector background
           bongo-visualizer--gradient
-          (vconcat (cl-loop for dy below height
-                            collect (bongo-visualizer--vu-color
-                                     (/ (float dy) (max 1 (1- height))))))
+          (bongo-visualizer--theme-gradient-vector height)
+          bongo-visualizer--peak-color (bongo-visualizer--theme-argb :caps)
+          bongo-visualizer--c-theme (bongo-visualizer--theme-vector)
+          bongo-visualizer--current-theme bongo-visualizer-theme
           bongo-visualizer--canvas
           (create-image (copy-sequence background) 'canvas t
                         :data-width width
@@ -573,6 +736,53 @@ the bins we actually display."
           (plist-get (cdr bongo-visualizer--canvas) :data)
           bongo-visualizer--levels nil
           bongo-visualizer--peaks nil)))
+
+(defun bongo-visualizer--apply-theme-change ()
+  "Rebuild the canvas for the current theme and refresh its display."
+  (bongo-visualizer--setup-canvas)
+  (if (eq bongo-visualizer-display 'mode-line)
+      (force-mode-line-update t)
+    (when (and bongo-visualizer--buffer
+               (buffer-live-p bongo-visualizer--buffer))
+      (with-current-buffer bongo-visualizer--buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (propertize " " 'display bongo-visualizer--canvas))
+          (insert "\n")
+          (goto-char (point-min)))))))
+
+(defun bongo-visualizer-cycle-theme (&optional n)
+  "Switch to the next visualizer color theme.
+With prefix argument N, move N themes forward; a negative N moves
+backwards."
+  (interactive "p")
+  (let* ((ids (mapcar #'car bongo-visualizer-themes))
+         (step (or n 1))
+         (index (or (cl-position bongo-visualizer-theme ids) 0))
+         (next (nth (% (+ index step) (length ids)) ids)))
+    (setq bongo-visualizer-theme next)
+    (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+      (bongo-visualizer--apply-theme-change))
+    (message "Bongo visualizer theme: %s"
+             (plist-get (bongo-visualizer--theme next) :label))))
+
+;;;###autoload
+(defun bongo-visualizer-set-theme (theme)
+  "Choose the visualizer color THEME by name.
+Interactively, prompt for one of `bongo-visualizer-themes'."
+  (interactive
+   (list (intern
+          (completing-read
+           "Visualizer theme: "
+           (mapcar (lambda (entry)
+                     (cons (plist-get (cdr entry) :label) (car entry)))
+                   bongo-visualizer-themes)
+           nil t))))
+  (setq bongo-visualizer-theme theme)
+  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+    (bongo-visualizer--apply-theme-change))
+  (message "Bongo visualizer theme: %s"
+           (plist-get (bongo-visualizer--theme theme) :label)))
 
 (defun bongo-visualizer--render (levels)
   "Paint LEVELS onto the canvas and refresh it."
@@ -679,6 +889,14 @@ Run this after changing the font size or the mode line height."
             nil)
            (t nil))))))
 
+(defun bongo-visualizer--module-theme-capable-p ()
+  "Return non-nil if the loaded C module accepts a theme argument."
+  (and (fboundp 'bongo-vis-render)
+       (condition-case nil
+           (let ((max (cdr (func-arity #'bongo-vis-render))))
+             (and (integerp max) (>= max 9)))
+         (error nil))))
+
 (defun bongo-visualizer--module-frame (player)
   "Render one frame with the C module for PLAYER."
   (let* ((playing (and player (not (bongo-player-paused-p player))))
@@ -691,17 +909,26 @@ Run this after changing the font size or the mode line height."
                  (bongo-visualizer--ensure-source player)
                  (or (bongo-visualizer--pcm-samples bongo-visualizer-window)
                      (make-vector bongo-visualizer-window 0.0))))))
-    (bongo-vis-render bongo-visualizer--canvas samples
-                      (or bongo-visualizer--width bongo-visualizer-width)
-                      (or bongo-visualizer--height bongo-visualizer-height)
-                      (float bongo-visualizer-sample-rate)
-                      (float-time)
-                      bongo-visualizer-style
-                      bongo-visualizer-transparent-background)))
+    ;; Older builds of the module only take eight arguments; pass the
+    ;; theme vector only when the module knows about it.
+    (apply #'bongo-vis-render
+           bongo-visualizer--canvas samples
+           (or bongo-visualizer--width bongo-visualizer-width)
+           (or bongo-visualizer--height bongo-visualizer-height)
+           (float bongo-visualizer-sample-rate)
+           (float-time)
+           bongo-visualizer-style
+           bongo-visualizer-transparent-background
+           (when (bongo-visualizer--module-theme-capable-p)
+             (list bongo-visualizer--c-theme)))))
 
 (defun bongo-visualizer--frame ()
   "Advance the animation by one frame."
   (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+    ;; Notice a theme change made with `setq' and rebuild the canvas so
+    ;; that the background and the Lisp gradient follow it too.
+    (unless (eq bongo-visualizer-theme bongo-visualizer--current-theme)
+      (bongo-visualizer--apply-theme-change))
     (let ((player (bongo-visualizer--player)))
       (pcase (bongo-visualizer--renderer)
         ('module (bongo-visualizer--module-frame player))
