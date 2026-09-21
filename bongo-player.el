@@ -114,14 +114,8 @@
   :type 'string
   :group 'bongo-player)
 
-(defcustom bongo-player-side 'bottom
-  "Side used to display the player window.
-One of `bottom', `top', `left' or `right'."
-  :type '(choice (const bottom) (const top) (const left) (const right))
-  :group 'bongo-player)
-
 (defcustom bongo-player-window-height 26
-  "Height in lines of the player side window.
+  "Height in lines of the player window.
 Make this large enough for the header (visualizer and progress bar)
 plus `bongo-player-lyrics-lines' lyric lines."
   :type 'integer
@@ -849,10 +843,9 @@ When CURRENT is non-nil, highlight the line."
     (setq bongo-player--window
           (display-buffer
            bongo-player--buffer
-           `(display-buffer-in-side-window
-             (side . ,bongo-player-side)
-             (slot . 0)
-             (window-height . ,bongo-player-window-height))))))
+           `(display-buffer-at-bottom
+             (window-height . ,bongo-player-window-height)
+             (dedicated . side))))))
 
 (defun bongo-player--teardown-buffer ()
   "Remove the player buffer and its window."
