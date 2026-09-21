@@ -1,0 +1,46 @@
+# Makefile for the Bongo visualizer dynamic module.
+#
+# Builds `bongo-visualizer-module', the C software renderer that
+# computes the FFT and draws every frame straight into the canvas pixel
+# buffer.  It is loaded automatically by `bongo-visualizer.el'.
+
+EMACS ?= emacs
+CC ?= cc
+
+# Where is emacs-module.h?  Override with
+#   make MODULE_HEADER=/path/to/emacs-module.h
+EMACS_MODULE_HEADER ?= $(shell $(EMACS) -Q --batch \
+  --eval '(princ (expand-file-name "src/emacs-module.h" source-directory))' 2>/dev/null)
+MODULE_HEADER ?= $(firstword $(wildcard \
+  /usr/local/include/emacs-module.h \
+  /opt/homebrew/include/emacs-module.h \
+  /usr/include/emacs-module.h \
+  $(HOME)/Github/emacs/src/emacs-module.h \
+  $(HOME)/src/emacs/src/emacs-module.h \
+  $(EMACS_MODULE_HEADER)))
+
+ifeq ($(MODULE_HEADER),)
+$(error Could not find emacs-module.h; set MODULE_HEADER=/path/to/emacs-module.h)
+endif
+
+MODULE_SUFFIX ?= $(shell $(EMACS) -Q --batch --eval '(princ module-file-suffix)' 2>/dev/null)
+TARGET = bongo-visualizer-module$(MODULE_SUFFIX)
+
+CFLAGS ?= -O2 -Wall -Wextra -fPIC
+CPPFLAGS += -I$(dir $(MODULE_HEADER))
+
+ifeq ($(shell uname -s),Darwin)
+  SHARED = -dynamiclib -undefined dynamic_lookup
+else
+  SHARED = -shared
+endif
+
+all: $(TARGET)
+
+$(TARGET): bongo-visualizer-module.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SHARED) -o $@ $< -lm
+
+clean:
+	rm -f bongo-visualizer-module.so bongo-visualizer-module.dylib
+
+.PHONY: all clean

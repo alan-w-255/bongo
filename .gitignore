@@ -1,0 +1,4 @@
+# Compiled Lisp and dynamic modules.
+*.elc
+*.dylib
+*.so

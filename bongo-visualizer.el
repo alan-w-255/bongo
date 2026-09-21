@@ -1,0 +1,839 @@
+;;; bongo-visualizer.el --- Music visualizer for Bongo using canvas images -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  Free Software Foundation, Inc.
+
+;; This file is not part of GNU Emacs.
+
+;;; Commentary:
+
+;; A music visualizer for Bongo, built on the `canvas' image type that
+;; was added in Emacs 31 (see Info node `(elisp) Canvas Images').
+;;
+;; A canvas is an image object with a writable ARGB32 pixel buffer.  A
+;; timer paints a frame into that buffer and calls `canvas-refresh', so
+;; no new Lisp object is allocated per frame.
+;;
+;; There are two renderers:
+;;
+;;   module  The C module `bongo-visualizer-module' computes a Hann
+;;           windowed FFT and draws the frame pixels-first on the CPU,
+;;           in the spirit of the Sonic Pi scope and spectrum views,
+;;           in a pink phosphor palette.  This is the default whenever
+;;           the module has been built.
+;;
+;;   Lisp    A pure-Lisp fallback that needs no compiler at all.
+;;
+;; Where do the samples come from?  Bongo itself just launches external
+;; players; it does not see the audio.  So this module decodes the
+;; currently playing file with ffmpeg into a PCM pipe once per track and
+;; indexes into it using `bongo-elapsed-time'.  If that is unavailable,
+;; it falls back to a procedural "demo" animation.
+;;
+;; Usage:
+;;   M-x bongo-visualizer-build-module RET   (once, compiles the C module)
+;;   (require 'bongo-visualizer)
+;;   (bongo-visualizer-mode 1)
+;;
+;; The C renderer is a dynamic module; without it a slower pure-Lisp
+;; renderer is used.
+;;
+;; In the mode line the canvas height defaults to the height of the mode
+;; line itself (see `bongo-visualizer-mode-line-height'), so that it
+;; fills it; run `M-x bongo-visualizer-refit' after changing the font
+;; size or if you set an explicit height.  The canvas background is
+;; transparent by default (see
+;; `bongo-visualizer-transparent-background'), so the mode line colour
+;; shows through and only the glowing waveform and spectrum are drawn.
+;;
+;; The visualizer follows whichever Bongo playlist buffer has an active
+;; player.  By default it is shown in the mode line of every buffer (see
+;; `bongo-visualizer-display'); set that to `side-window' to put it in a
+;; dedicated buffer at the bottom of the frame instead.
+
+;;; Code:
+
+(require 'bongo)
+(require 'cl-lib)
+(require 'subr-x)
+
+(defconst bongo-visualizer--directory
+  (let* ((this (or load-file-name buffer-file-name))
+         (dir (file-name-directory this))
+         ;; straight.el loads packages from a build directory whose `.el'
+         ;; files are symlinks into the checkout.  Resolve the symlink so
+         ;; that the C source, the Makefile and the built module can be
+         ;; found next to the real file rather than next to the `.elc'.
+         (source (expand-file-name "bongo-visualizer.el" dir))
+         (file (if (file-exists-p source) source this)))
+    (file-name-directory (file-truename file)))
+  "Directory containing `bongo-visualizer.el'.")
+
+(defun bongo-visualizer--source-directory ()
+  "Return the directory holding the Makefile and the C source.
+When the library was loaded from a straight.el build directory this
+resolves the build symlink back into the package checkout."
+  (or (cl-find-if
+       (lambda (dir)
+         (and dir
+              (file-exists-p (expand-file-name "Makefile.bongo-visualizer"
+                                               dir))))
+       (list bongo-visualizer--directory
+             (let ((el (expand-file-name "bongo-visualizer.el"
+                                         bongo-visualizer--directory)))
+               (and (file-exists-p el)
+                    (file-name-directory (file-truename el))))))
+      bongo-visualizer--directory))
+
+;; Provided at runtime by the optional C module (see the Makefile).
+(declare-function bongo-vis-render "bongo-visualizer-module"
+                  (canvas samples width height rate time &optional style
+                          transparent))
+(declare-function bongo-vis-reset "bongo-visualizer-module" ())
+(declare-function bongo-vis-spectrum "bongo-visualizer-module"
+                  (samples rate bins))
+(declare-function bongo-vis-waveform "bongo-visualizer-module"
+                  (samples bins))
+
+(defgroup bongo-visualizer nil
+  "Music visualizer for Bongo."
+  :group 'bongo
+  :prefix "bongo-visualizer-")
+
+(defcustom bongo-visualizer-width 360
+  "Width of the visualizer canvas, in pixels."
+  :type 'integer)
+
+(defcustom bongo-visualizer-height 100
+  "Height of the visualizer canvas, in pixels."
+  :type 'integer)
+
+(defcustom bongo-visualizer-display 'mode-line
+  "Where to display the visualizer.
+`mode-line' puts the canvas in `global-mode-string', so that it shows
+in the mode line of every buffer.  `side-window' shows it in a
+dedicated buffer in a side window instead."
+  :type '(choice (const :tag "Mode line" mode-line)
+                 (const :tag "Side window" side-window)))
+
+(defcustom bongo-visualizer-transparent-background t
+  "Whether the visualizer canvas has a transparent background.
+This is what you want in the mode line: the mode line colour shows
+through and only the glowing waveform and spectrum are drawn.  Set it
+to nil for the opaque dark background of the separate buffer."
+  :type 'boolean)
+
+(defcustom bongo-visualizer-mode-line-width 240
+  "Displayed width in pixels of the visualizer in the mode line.
+The canvas is scaled by `bongo-visualizer-scale'."
+  :type 'integer)
+
+(defcustom bongo-visualizer-mode-line-height nil
+  "Displayed height in pixels of the visualizer in the mode line.
+If nil, match the height of the mode line of the selected window, so
+that the visualizer fills it.  Set it to an integer to force a size.
+The canvas is scaled by `bongo-visualizer-scale'."
+  :type '(choice (const :tag "Fit the mode line" nil)
+                 integer))
+
+(defcustom bongo-visualizer-ascent 'center
+  "Ascent used when displaying the canvas image.
+The default `center' vertically centers the canvas on the surrounding
+text (as Bongo's own track icons do), so that it lines up with the mode
+line text.  A number in 0..100 is interpreted as that percentage of the
+image height above the baseline, which is how Emacs places images by
+default; 50 therefore puts the image's center on the baseline and makes
+it look too low.  A number may be useful to fine-tune the alignment if
+the mode line has a box or unusual padding."
+  :type '(choice (const :tag "Center on text" center)
+                 integer))
+
+(defcustom bongo-visualizer-scale 1
+  "Scale factor for the displayed canvas image.
+On HiDPI/Retina displays you may want 0.5 so the image is not huge."
+  :type 'number)
+
+(defcustom bongo-visualizer-fps 30
+  "Frames per second for the visualizer animation."
+  :type 'integer)
+
+(defcustom bongo-visualizer-bands 24
+  "Number of spectrum bars."
+  :type 'integer)
+
+(defcustom bongo-visualizer-lowest-frequency 60.0
+  "Lowest centre frequency analyzed, in Hz."
+  :type 'number)
+
+(defcustom bongo-visualizer-sample-rate 8000
+  "Sample rate used when decoding audio with ffmpeg.
+The Nyquist frequency is half of this, and is the highest band."
+  :type 'integer)
+
+(defcustom bongo-visualizer-window 512
+  "Number of samples (per band) used for each spectrum estimate.
+Bigger is more frequency-selective but slower: the Goertzel loop runs
+`bands' times over this many samples on every frame."
+  :type 'integer)
+
+(defcustom bongo-visualizer-source 'ffmpeg
+  "Where the visualizer gets its data from.
+`ffmpeg' decodes the playing file to PCM and computes a real spectrum.
+`demo' ignores the audio and draws a procedural animation."
+  :type '(choice (const :tag "Decode with ffmpeg" ffmpeg)
+                 (const :tag "Procedural demo" demo)))
+
+(defcustom bongo-visualizer-use-module t
+  "Whether to use the optional C dynamic module when it is available.
+The module does the FFT and the rendering in C and writes straight into
+the canvas pixel buffer, which is much faster and much prettier than
+the pure-Lisp fallback.  See `bongo-visualizer-module-file'."
+  :type 'boolean)
+
+(defcustom bongo-visualizer-module-file nil
+  "Path of the visualizer dynamic module.
+If nil, look for `bongo-visualizer-module' next to this file."
+  :type '(choice (const :tag "Next to bongo-visualizer.el" nil)
+                 file))
+
+(defcustom bongo-visualizer-style 0
+  "Visual style used by the built-in C software renderer.
+Following the Sonic Pi visualisers, the choices are a scope (the green
+oscilloscope), a spectrum (the rainbow analyser wings), or both."
+  :type '(choice (const :tag "Scope and spectrum" 0)
+                 (const :tag "Scope only" 1)
+                 (const :tag "Spectrum only" 2)))
+
+(defcustom bongo-visualizer-renderer 'auto
+  "Which engine draws the frames.
+`auto' prefers the built-in C renderer and falls back to pure Lisp.
+`module' and `lisp' force one of them."
+  :type '(choice (const :tag "Prefer C" auto)
+                 (const :tag "C software renderer" module)
+                 (const :tag "Pure Lisp" lisp)))
+
+(defcustom bongo-visualizer-ffmpeg-program "ffmpeg"
+  "Name of the ffmpeg executable."
+  :type 'string)
+
+(defcustom bongo-visualizer-ffmpeg-arguments '("-v" "error" "-nostdin")
+  "Arguments passed to ffmpeg before `-i FILE'."
+  :type '(repeat string))
+
+(defcustom bongo-visualizer-latency 0.15
+  "How many seconds to look behind the reported playback time.
+Compensates for the delay between `bongo-elapsed-time' and what you
+actually hear, and makes sure ffmpeg has decoded that far."
+  :type 'number)
+
+(defcustom bongo-visualizer-decay 0.80
+  "Per-frame decay factor for bar levels (1.0 freezes, 0.0 is instant)."
+  :type 'number)
+
+(defcustom bongo-visualizer-db-offset 55.0
+  "Number of dB added before mapping power to a bar height."
+  :type 'number)
+
+(defcustom bongo-visualizer-db-range 60.0
+  "Dynamic range, in dB, that maps to the full bar height."
+  :type 'number)
+
+(defcustom bongo-visualizer-peaks t
+  "Whether to draw falling peak caps above each bar."
+  :type 'boolean)
+
+(defcustom bongo-visualizer-buffer-name "*Bongo Visualizer*"
+  "Name of the buffer holding the visualizer canvas."
+  :type 'string)
+
+(defcustom bongo-visualizer-side 'bottom
+  "Side used to display the visualizer window.
+One of `bottom', `top', `left', `right', or nil to reuse any window."
+  :type '(choice (const bottom) (const top) (const left) (const right)
+                 (const :tag "Any window" nil)))
+
+
+;;;; Colors
+
+(defsubst bongo-visualizer--argb (r g b &optional a)
+  "Pack A, R, G, B bytes into an ARGB32 fixnum.
+R, G and B are clamped to 0..255; A defaults to fully opaque."
+  (let ((clamp (lambda (x) (max 0 (min 255 (round x))))))
+    (logior (ash (funcall clamp (or a 255)) 24)
+            (ash (funcall clamp r) 16)
+            (ash (funcall clamp g) 8)
+            (funcall clamp b))))
+
+(defconst bongo-visualizer--background
+  (bongo-visualizer--argb 12 14 22)
+  "Background color of the canvas.")
+
+(defconst bongo-visualizer--grid-color
+  (bongo-visualizer--argb 28 32 48)
+  "Color of the horizontal grid lines.")
+
+(defconst bongo-visualizer--peak-color
+  (bongo-visualizer--argb 235 235 245)
+  "Color of the falling peak caps.")
+
+(defun bongo-visualizer--vu-color (frac)
+  "Return an ARGB color for the classic VU gradient at FRAC (0..1).
+Zero is green (bottom), 0.5 yellow, 1.0 red (top)."
+  (if (< frac 0.5)
+      (bongo-visualizer--argb (* 510.0 frac) 255 0)
+    (bongo-visualizer--argb 255 (* 510.0 (- 1.0 frac)) 0)))
+
+
+;;;; Canvas state
+
+(defvar bongo-visualizer-mode)  ; defined by `define-minor-mode' below
+
+(defvar bongo-visualizer--canvas nil
+  "The canvas image object.")
+(defvar bongo-visualizer--width nil
+  "Width in pixels of the current canvas.")
+(defvar bongo-visualizer--height nil
+  "Height in pixels of the current canvas.")
+(defvar bongo-visualizer--data nil
+  "The ARGB32 pixel vector of the canvas.")
+(defvar bongo-visualizer--background-vector nil
+  "Pristine background pixels, copied at the start of every frame.")
+(defvar bongo-visualizer--buffer nil
+  "Buffer displaying the canvas.")
+(defvar bongo-visualizer--timer nil
+  "Repeating timer driving the animation.")
+(defvar bongo-visualizer--levels nil
+  "List of smoothed bar levels, each between 0.0 and 1.0.")
+(defvar bongo-visualizer--peaks nil
+  "List of falling peak positions.")
+(defvar bongo-visualizer--gradient nil
+  "Vector mapping a row offset to its VU gradient color.")
+
+
+;;;; PCM source
+
+(defvar bongo-visualizer--pcm-buffer nil
+  "Unibyte buffer accumulating raw little-endian s16 samples.")
+(defvar bongo-visualizer--pcm-process nil
+  "The ffmpeg decoding process.")
+(defvar bongo-visualizer--current-file nil
+  "File currently being decoded.")
+
+(defun bongo-visualizer--pcm-available ()
+  "Return the number of bytes available in the PCM buffer, or 0."
+  (if (and bongo-visualizer--pcm-buffer
+           (buffer-live-p bongo-visualizer--pcm-buffer))
+      (with-current-buffer bongo-visualizer--pcm-buffer
+        ;; `buffer-size' is the number of bytes in this unibyte buffer.
+        (buffer-size))
+    0))
+
+(defun bongo-visualizer--stop-pcm ()
+  "Kill the decoding process and discard its buffer."
+  (when (and bongo-visualizer--pcm-process
+             (process-live-p bongo-visualizer--pcm-process))
+    (delete-process bongo-visualizer--pcm-process))
+  (setq bongo-visualizer--pcm-process nil
+        bongo-visualizer--current-file nil)
+  (when (and bongo-visualizer--pcm-buffer
+             (buffer-live-p bongo-visualizer--pcm-buffer))
+    (kill-buffer bongo-visualizer--pcm-buffer))
+  (setq bongo-visualizer--pcm-buffer nil))
+
+(defun bongo-visualizer--start-pcm (file)
+  "Start decoding FILE to raw PCM with ffmpeg."
+  (bongo-visualizer--stop-pcm)
+  (let* ((rate bongo-visualizer-sample-rate)
+         (buffer (generate-new-buffer " *bongo-visualizer-pcm*")))
+    ;; The buffer must be unibyte *before* any process output arrives, and
+    ;; the process must never decode the bytes; `make-process' lets us set
+    ;; both up front.  Otherwise byte offsets and character positions
+    ;; diverge and the samples get mangled.
+    (with-current-buffer buffer
+      (set-buffer-multibyte nil))
+    (let ((process
+           (make-process
+            :name "bongo-visualizer-ffmpeg"
+            :buffer buffer
+            ;; Do NOT let stderr share the stdout buffer: ffmpeg writes
+            ;; diagnostics even with `-v error', and a single stray byte
+            ;; shifts every sample and destroys the spectrum.
+            :stderr (get-buffer-create " *bongo-visualizer-ffmpeg-stderr*")
+            :command (append (list bongo-visualizer-ffmpeg-program)
+                             bongo-visualizer-ffmpeg-arguments
+                             (list "-i" file
+                                   "-vn" "-ac" "1"
+                                   "-ar" (number-to-string rate)
+                                   "-f" "s16le" "-"))
+            :coding 'no-conversion
+            :connection-type 'pipe
+            :sentinel #'ignore
+            :noquery t)))
+      (setq bongo-visualizer--pcm-buffer buffer
+            bongo-visualizer--pcm-process process
+            bongo-visualizer--current-file file))))
+
+(defun bongo-visualizer--ensure-source (player)
+  "Make sure the PCM source matches what PLAYER is playing."
+  (when (eq bongo-visualizer-source 'ffmpeg)
+    (let ((file (ignore-errors (bongo-player-file-name player))))
+      (when (and (stringp file)
+                 (not (equal file bongo-visualizer--current-file)))
+        (condition-case err
+            (bongo-visualizer--start-pcm file)
+          (error
+           (message "bongo-visualizer: ffmpeg failed: %s"
+                    (error-message-string err))))))))
+
+(defun bongo-visualizer--pcm-samples (n)
+  "Return a vector of N floats in [-1, 1] ending at the playback position.
+Return nil if no PCM data is available (yet)."
+  (let ((available (bongo-visualizer--pcm-available)))
+    (when (> available 4)
+      (let* ((rate bongo-visualizer-sample-rate)
+             (time (- (or (bongo-elapsed-time) 0.0)
+                      bongo-visualizer-latency))
+             (center (round (* time rate)))
+             (start (max 0 (- center (/ n 2))))
+             (start-byte (* 2 start))
+             (end-byte (min available (+ start-byte (* 2 n)))))
+        (when (> (- end-byte start-byte) 4)
+          (with-current-buffer bongo-visualizer--pcm-buffer
+            (let* ((raw (buffer-substring-no-properties (1+ start-byte)
+                                                        (1+ end-byte)))
+                   (length (length raw))
+                   (samples (make-vector n 0.0))
+                   (i 0)
+                   (j 0))
+              (while (and (< j n) (< (1+ i) length))
+                (let ((value (logior (aref raw i)
+                                     (ash (aref raw (1+ i)) 8))))
+                  (when (>= value 32768)
+                    (setq value (- value 65536)))
+                  (aset samples j (/ value 32768.0)))
+                (setq i (+ i 2)
+                      j (1+ j)))
+              samples)))))))
+
+
+;;;; Spectrum analysis
+
+(defun bongo-visualizer--band-frequencies (n rate)
+  "Return N log-spaced frequencies between the low bound and RATE's Nyquist."
+  (let ((low bongo-visualizer-lowest-frequency)
+        (high (* 0.5 rate)))
+    (cl-loop for i from 0 below n
+             collect (* low (expt (/ high low)
+                                 (/ (float i) (max 1 (1- n))))))))
+
+(defun bongo-visualizer--goertzel (samples frequency rate)
+  "Return the power of FREQUENCY in SAMPLES sampled at RATE.
+This is the Goertzel algorithm: a single-bin DFT, so we only pay for
+the bins we actually display."
+  (let* ((n (length samples))
+         (k (/ (* frequency n) rate))
+         (w (/ (* 2.0 float-pi k) n))
+         (coefficient (* 2.0 (cos w)))
+         (s-prev 0.0)
+         (s-prev2 0.0))
+    (dotimes (i n)
+      (let ((s (+ (aref samples i)
+                  (* coefficient s-prev)
+                  (- s-prev2))))
+        (setq s-prev2 s-prev
+              s-prev s)))
+    (+ (* s-prev s-prev)
+       (* s-prev2 s-prev2)
+       (- (* coefficient s-prev s-prev2)))))
+
+(defun bongo-visualizer--power-to-level (power n)
+  "Convert Goertzel POWER over N samples to a bar height in 0..1."
+  (let* ((amplitude (/ (sqrt (max 0.0 power)) (float n)))
+         (db (+ (* 20.0 (log (max amplitude 1e-6) 10.0))
+                bongo-visualizer-db-offset))
+         (level (/ db bongo-visualizer-db-range)))
+    (max 0.0 (min 1.0 level))))
+
+(defun bongo-visualizer--demo-levels ()
+  "Return a procedural spectrum, used when no PCM data is available."
+  (let ((time (float-time))
+        (n bongo-visualizer-bands))
+    (cl-loop for i below n
+             collect (max 0.0 (min 1.0
+                                   (* 0.55
+                                      (+ 1.0
+                                         (sin (+ (* time (+ 1.0 (/ i 4.0)))
+                                                 (* i 0.7)))
+                                         (* 0.3 (sin (* time 3.7 i))))))))))
+
+(defun bongo-visualizer--demo-samples ()
+  "Return a window of synthetic PCM for the C module's demo mode."
+  (let* ((n bongo-visualizer-window)
+         (rate (float bongo-visualizer-sample-rate))
+         (t0 (float-time))
+         (samples (make-vector n 0.0)))
+    (dotimes (i n)
+      (let ((tt (+ t0 (/ i rate))))
+        (aset samples i
+              (* 0.45 (+ (sin (* 2.0 float-pi 220.0 tt))
+                         (* 0.6 (sin (* 2.0 float-pi 440.0 tt)))
+                         (* 0.35 (sin (* 2.0 float-pi 660.0 tt))))))))
+    samples))
+
+(defun bongo-visualizer--compute-levels ()
+  "Compute the raw bar levels for the current frame."
+  (if (eq bongo-visualizer-source 'demo)
+      (bongo-visualizer--demo-levels)
+    (let ((samples (bongo-visualizer--pcm-samples bongo-visualizer-window)))
+      (if (null samples)
+          (bongo-visualizer--demo-levels)
+        (let ((rate bongo-visualizer-sample-rate)
+              (n (length samples)))
+          (mapcar (lambda (frequency)
+                    (bongo-visualizer--power-to-level
+                     (bongo-visualizer--goertzel samples frequency rate)
+                     n))
+                  (bongo-visualizer--band-frequencies
+                   bongo-visualizer-bands rate)))))))
+
+(defun bongo-visualizer--smooth (new old)
+  "Blend NEW levels with OLD ones using `bongo-visualizer-decay'."
+  (if (or (null old) (/= (length new) (length old)))
+      new
+    (cl-mapcar (lambda (n o) (max n (* o bongo-visualizer-decay)))
+               new old)))
+
+(defun bongo-visualizer--track-peaks (levels)
+  "Update and return falling peak positions for LEVELS."
+  (let ((old bongo-visualizer--peaks)
+        (height (or bongo-visualizer--height bongo-visualizer-height)))
+    (setq bongo-visualizer--peaks
+          (cl-mapcar (lambda (level peak)
+                       (let ((peak (or peak 0.0)))
+                         (cond ((>= level peak) level)
+                               (t (max 0.0 (- peak (/ 1.0 height)))))))
+                     levels
+                     (if (and old (= (length old) (length levels)))
+                         old
+                       (make-list (length levels) 0.0))))))
+
+
+;;;; Rendering
+
+(defun bongo-visualizer--mode-line-canvas-height ()
+  "Return the pixel height to use for the mode line visualizer canvas."
+  (or (and (integerp bongo-visualizer-mode-line-height)
+           bongo-visualizer-mode-line-height)
+      (let ((height (and (fboundp 'window-mode-line-height)
+                         (window-live-p (selected-window))
+                         (window-mode-line-height))))
+        (if (and height (> height 1))
+            height
+          (frame-char-height)))))
+
+(defun bongo-visualizer--setup-canvas ()
+  "Create the canvas image and its background vector."
+  (let* ((scale (if (and (numberp bongo-visualizer-scale)
+                         (> bongo-visualizer-scale 0))
+                    bongo-visualizer-scale
+                  1.0))
+         (width (if (eq bongo-visualizer-display 'mode-line)
+                    (round (/ bongo-visualizer-mode-line-width scale))
+                  bongo-visualizer-width))
+         (height (if (eq bongo-visualizer-display 'mode-line)
+                     (round (/ (bongo-visualizer--mode-line-canvas-height) scale))
+                   bongo-visualizer-height))
+         (background-color (if bongo-visualizer-transparent-background
+                               (bongo-visualizer--argb 0 0 0 1)
+                             bongo-visualizer--background))
+         (grid-color (if bongo-visualizer-transparent-background
+                         (bongo-visualizer--argb 0 0 0 1)
+                       bongo-visualizer--grid-color))
+         (background (make-vector (* width height)
+                                  background-color)))
+    ;; A couple of horizontal grid lines for depth.
+    (dotimes (i height)
+      (when (zerop (mod i (max 1 (/ height 4))))
+        (dotimes (x width)
+          (aset background (+ (* i width) x) grid-color))))
+    (setq bongo-visualizer--width width
+          bongo-visualizer--height height
+          bongo-visualizer--background-vector background
+          bongo-visualizer--gradient
+          (vconcat (cl-loop for dy below height
+                            collect (bongo-visualizer--vu-color
+                                     (/ (float dy) (max 1 (1- height))))))
+          bongo-visualizer--canvas
+          (create-image (copy-sequence background) 'canvas t
+                        :data-width width
+                        :data-height height
+                        :scale bongo-visualizer-scale
+                        :ascent bongo-visualizer-ascent
+                        :id 'bongo-visualizer)
+          bongo-visualizer--data
+          (plist-get (cdr bongo-visualizer--canvas) :data)
+          bongo-visualizer--levels nil
+          bongo-visualizer--peaks nil)))
+
+(defun bongo-visualizer--render (levels)
+  "Paint LEVELS onto the canvas and refresh it."
+  (when (and bongo-visualizer--canvas bongo-visualizer--data)
+    (let* ((width (or bongo-visualizer--width bongo-visualizer-width))
+           (height (or bongo-visualizer--height bongo-visualizer-height))
+           (bands (max 1 (length levels)))
+           (bar-width (max 1 (/ width bands)))
+           (gap (if (>= bar-width 4) 1 0))
+           (smooth-levels levels))
+      ;; Start from a pristine background: this is a C-level vector copy,
+      ;; much faster than clearing pixel by pixel from Lisp.
+      (setq bongo-visualizer--data
+            (copy-sequence bongo-visualizer--background-vector))
+      (plist-put (cdr bongo-visualizer--canvas)
+                 :data bongo-visualizer--data)
+      (let ((data bongo-visualizer--data))
+        (cl-loop for level in smooth-levels
+                 for band from 0
+                 for x0 = (* band bar-width)
+                 for bar-height = (min height
+                                       (round (* (max 0.0 (min 1.0 level))
+                                                 (- height 2))))
+                 do (dotimes (dx (max 0 (- bar-width gap)))
+                      (let ((x (+ x0 dx)))
+                        (when (< x width)
+                          (dotimes (dy bar-height)
+                            (let ((y (- height 1 dy)))
+                              (aset data (+ (* y width) x)
+                                    (aref bongo-visualizer--gradient dy))))
+                          (when bongo-visualizer-peaks
+                            (let* ((peak (or (nth band bongo-visualizer--peaks)
+                                             0.0))
+                                   (py (- height 1
+                                          (min (1- height)
+                                               (round (* peak (- height 2)))))))
+                              (when (>= py 0)
+                                (aset data (+ (* py width) x)
+                                      bongo-visualizer--peak-color)))))))))
+      (canvas-refresh bongo-visualizer--canvas 'reload-data))))
+
+
+;;;; The frame loop
+
+(defun bongo-visualizer--player ()
+  "Return the active Bongo player, or nil.  Does not create buffers."
+  (catch 'found
+    (dolist (buffer (buffer-list))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (and (bongo-playlist-buffer-p)
+                     bongo-player
+                     (bongo-player-running-p bongo-player))
+            (throw 'found bongo-player)))))
+    nil))
+
+(defun bongo-visualizer--module-active-p ()
+  "Return non-nil if the C module should draw the frames."
+  (and bongo-visualizer-use-module
+       (fboundp 'bongo-vis-render)))
+
+(defun bongo-visualizer-build-module ()
+  "Compile the C renderer module with `make'.
+Run this once before enabling `bongo-visualizer-mode', or after editing
+`bongo-visualizer-module.c'."
+  (interactive)
+  (let ((default-directory (bongo-visualizer--source-directory)))
+    (compile (format "make -f %s"
+                     (shell-quote-argument
+                      (expand-file-name "Makefile.bongo-visualizer"
+                                        default-directory))))))
+
+(defun bongo-visualizer-refit ()
+  "Resize the visualizer canvas to fit the current mode line.
+Run this after changing the font size or the mode line height."
+  (interactive)
+  (if (not bongo-visualizer-mode)
+      (message "Bongo visualizer is not enabled")
+    (bongo-visualizer--setup-canvas)
+    (force-mode-line-update t)
+    (message "Bongo visualizer: canvas is now %dx%d"
+             bongo-visualizer--width bongo-visualizer--height)))
+
+(defun bongo-visualizer--load-module ()
+  "Load the C module if it can be found.  Return non-nil if available."
+  (or (fboundp 'bongo-vis-render)
+      (when bongo-visualizer-use-module
+        (let* ((dir (bongo-visualizer--source-directory))
+               (file (or bongo-visualizer-module-file
+                         (expand-file-name
+                          (concat "bongo-visualizer-module" module-file-suffix)
+                          dir))))
+          (cond
+           ((file-exists-p file)
+            (condition-case err
+                (progn (module-load file) t)
+              (error
+               (message "bongo-visualizer: cannot load %s: %s"
+                        file (error-message-string err))
+               nil)))
+           ((file-exists-p (expand-file-name "Makefile.bongo-visualizer" dir))
+            (message "bongo-visualizer: %s is not built; run %s"
+                     file "M-x bongo-visualizer-build-module")
+            nil)
+           (t nil))))))
+
+(defun bongo-visualizer--module-frame (player)
+  "Render one frame with the C module for PLAYER."
+  (let* ((playing (and player (not (bongo-player-paused-p player))))
+         (samples
+          (cond ((not playing)
+                 (make-vector bongo-visualizer-window 0.0))
+                ((eq bongo-visualizer-source 'demo)
+                 (bongo-visualizer--demo-samples))
+                (t
+                 (bongo-visualizer--ensure-source player)
+                 (or (bongo-visualizer--pcm-samples bongo-visualizer-window)
+                     (make-vector bongo-visualizer-window 0.0))))))
+    (bongo-vis-render bongo-visualizer--canvas samples
+                      (or bongo-visualizer--width bongo-visualizer-width)
+                      (or bongo-visualizer--height bongo-visualizer-height)
+                      (float bongo-visualizer-sample-rate)
+                      (float-time)
+                      bongo-visualizer-style
+                      bongo-visualizer-transparent-background)))
+
+(defun bongo-visualizer--frame ()
+  "Advance the animation by one frame."
+  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+    (let ((player (bongo-visualizer--player)))
+      (pcase (bongo-visualizer--renderer)
+        ('module (bongo-visualizer--module-frame player))
+        (_ (bongo-visualizer--frame-lisp player))))))
+
+(defun bongo-visualizer--renderer ()
+  "Return the renderer to use: `module' or `lisp'."
+  (pcase bongo-visualizer-renderer
+    ('module 'module)
+    ('lisp 'lisp)
+    (_ (if (bongo-visualizer--module-active-p) 'module 'lisp))))
+
+(defun bongo-visualizer--frame-lisp (player)
+  "Pure-Lisp frame rendering for PLAYER, when the C module is unavailable."
+  (let ((active (and player
+                     (not (bongo-player-paused-p player)))))
+    (if active
+        (progn
+          (bongo-visualizer--ensure-source player)
+          (setq bongo-visualizer--levels
+                (bongo-visualizer--smooth (bongo-visualizer--compute-levels)
+                                          bongo-visualizer--levels))
+          (bongo-visualizer--track-peaks bongo-visualizer--levels))
+      (setq bongo-visualizer--levels
+            (mapcar (lambda (level) (* level 0.9))
+                    (or bongo-visualizer--levels
+                        (make-list bongo-visualizer-bands 0.0))))
+      (setq bongo-visualizer--peaks
+            (mapcar (lambda (peak) (* peak 0.9))
+                    (or bongo-visualizer--peaks
+                        (make-list bongo-visualizer-bands 0.0)))))
+    (bongo-visualizer--render (or bongo-visualizer--levels
+                                  (make-list bongo-visualizer-bands 0.0)))))
+
+(defun bongo-visualizer--sync-source (&rest _)
+  "Restart the PCM decoder for the new track, if any."
+  (when (and bongo-visualizer-mode
+             (eq bongo-visualizer-source 'ffmpeg)
+             bongo-player)
+    (let ((file (ignore-errors (bongo-player-file-name bongo-player))))
+      (when (and (stringp file)
+                 (not (equal file bongo-visualizer--current-file)))
+        (bongo-visualizer--start-pcm file)))))
+
+
+;;;; Display
+
+(defvar bongo-visualizer--mode-line-entry
+  '(:eval (bongo-visualizer--mode-line))
+  "Mode line construct that displays the visualizer canvas.")
+
+(defun bongo-visualizer--mode-line ()
+  "Return the mode line construct for the visualizer canvas."
+  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+    (propertize " " 'display bongo-visualizer--canvas
+                'help-echo "Bongo visualizer")))
+
+(defun bongo-visualizer--show-mode-line (show)
+  "Add the visualizer to the global mode line when SHOW is non-nil."
+  (if show
+      (unless (member bongo-visualizer--mode-line-entry global-mode-string)
+        (setq global-mode-string
+              (if (listp global-mode-string)
+                  (append global-mode-string
+                          (list bongo-visualizer--mode-line-entry))
+                (list bongo-visualizer--mode-line-entry))))
+    (when (listp global-mode-string)
+      (setq global-mode-string
+            (delete bongo-visualizer--mode-line-entry global-mode-string)))))
+
+(defun bongo-visualizer--setup-buffer ()
+  "Create and display the visualizer buffer."
+  (setq bongo-visualizer--buffer
+        (get-buffer-create bongo-visualizer-buffer-name))
+  (with-current-buffer bongo-visualizer--buffer
+    (setq buffer-read-only nil)
+    (erase-buffer)
+    (insert (propertize " " 'display bongo-visualizer--canvas))
+    (insert "\n")
+    (goto-char (point-min))
+    (setq-local cursor-type nil)
+    (setq-local truncate-lines t)
+    (setq-local mode-line-format nil)
+    (setq buffer-read-only t))
+  (when bongo-visualizer-side
+    (display-buffer
+     bongo-visualizer--buffer
+     `(display-buffer-in-side-window
+       (side . ,bongo-visualizer-side)
+       (slot . 0)
+       (window-height . ,(1+ (ceiling (/ (or bongo-visualizer--height
+                                             bongo-visualizer-height)
+                                         (float (frame-char-height))))))))))
+
+;;;###autoload
+(define-minor-mode bongo-visualizer-mode
+  "Toggle the Bongo music visualizer.
+With a prefix argument ARG, enable the mode if ARG is positive.
+This is a global minor mode; the visualizer follows whichever Bongo
+playlist buffer currently has an active player."
+  :global t
+  :group 'bongo-visualizer
+  (if bongo-visualizer-mode
+      (progn
+        (bongo-visualizer--load-module)
+        (when (fboundp 'bongo-vis-reset)
+          (bongo-vis-reset))
+        (bongo-visualizer--setup-canvas)
+        (if (eq bongo-visualizer-display 'mode-line)
+            (bongo-visualizer--show-mode-line t)
+          (bongo-visualizer--setup-buffer))
+        (add-hook 'bongo-player-started-hook #'bongo-visualizer--sync-source)
+        (add-hook 'bongo-player-sought-hook #'bongo-visualizer--sync-source)
+        (setq bongo-visualizer--timer
+              (run-with-timer 0 (/ 1.0 (max 1 bongo-visualizer-fps))
+                              #'bongo-visualizer--frame)))
+    (when bongo-visualizer--timer
+      (cancel-timer bongo-visualizer--timer)
+      (setq bongo-visualizer--timer nil))
+    (remove-hook 'bongo-player-started-hook #'bongo-visualizer--sync-source)
+    (remove-hook 'bongo-player-sought-hook #'bongo-visualizer--sync-source)
+    (bongo-visualizer--show-mode-line nil)
+    (bongo-visualizer--stop-pcm)
+    (when (fboundp 'bongo-vis-reset)
+      (bongo-vis-reset))
+    (when (and bongo-visualizer--buffer
+               (buffer-live-p bongo-visualizer--buffer))
+      (kill-buffer bongo-visualizer--buffer))
+    (setq bongo-visualizer--buffer nil
+          bongo-visualizer--canvas nil
+          bongo-visualizer--data nil)))
+
+
+(provide 'bongo-visualizer)
+;;; bongo-visualizer.el ends here
