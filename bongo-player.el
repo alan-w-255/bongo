@@ -204,14 +204,11 @@ and to the height of the mode line when that is nil too."
 (defvar bongo-player--canvas nil
   "Visualizer canvas shown in the player buffer, or nil.")
 
-(defvar bongo-player--canvas-owner nil
-  "Non-nil when the player created the visualizer canvas itself.")
-
-(defvar bongo-player--visualizer-mode-was-on nil
-  "Non-nil when the player disabled `bongo-visualizer-mode'.")
+(defvar bongo-player--visualizer nil
+  "Player-owned visualizer view, or nil.")
 
 (defvar bongo-player--visualizer-timer nil
-  "Timer driving the visualizer while the player owns the canvas.")
+  "Timer driving the player-buffer visualizer.")
 
 (defvar bongo-player--enabled-lyrics nil
   "Non-nil when `bongo-player-mode' enabled the lyrics engine.")
@@ -306,34 +303,33 @@ right-aligned after it."
 
 (defun bongo-player--setup-visualizer ()
   "Create the visualizer canvas shown in the player buffer.
-When `bongo-visualizer-mode' is enabled, it is temporarily disabled
-so that the player can own a full-size canvas; the mode is restored
-when the player is turned off."
+The player owns an independent view, so it does not disturb the
+mode-line visualizer and both can run at the same time."
   (when (and bongo-player-show-visualizer
              (fboundp 'bongo-visualizer-render-frame))
-    (setq bongo-player--visualizer-mode-was-on
-          (and (bound-and-true-p bongo-visualizer-mode) t))
-    (when bongo-player--visualizer-mode-was-on
-      (bongo-visualizer-mode -1))
-    (let ((bongo-visualizer-display 'buffer))
-      (bongo-visualizer--setup-canvas))
-    (setq bongo-player--canvas bongo-visualizer--canvas
-          bongo-player--canvas-owner t
+    (setq bongo-player--visualizer
+          (bongo-visualizer--new-view 'buffer))
+    (bongo-visualizer--setup-canvas bongo-player--visualizer)
+    (setq bongo-player--canvas
+          (bongo-visualizer--view-canvas bongo-player--visualizer)
           bongo-player--visualizer-timer
           (run-with-timer 0 (/ 1.0 (max 1 bongo-visualizer-fps))
                           #'bongo-player--visualizer-tick))))
 
 (defun bongo-player--sync-canvas ()
   "Notice a visualizer canvas replaced by a theme change."
-  (when (and bongo-player--canvas
-             (not (eq bongo-player--canvas bongo-visualizer--canvas)))
-    (setq bongo-player--canvas bongo-visualizer--canvas
-          bongo-player--dirty t)))
+  (let ((canvas (and bongo-player--visualizer
+                     (bongo-visualizer--view-canvas
+                      bongo-player--visualizer))))
+    (when (and canvas (not (eq bongo-player--canvas canvas)))
+      (setq bongo-player--canvas canvas
+            bongo-player--dirty t))))
 
 (defun bongo-player--visualizer-tick ()
   "Render one visualizer frame for the player buffer."
-  (when (and bongo-player-mode bongo-player--canvas)
-    (ignore-errors (bongo-visualizer-render-frame))
+  (when (and bongo-player-mode bongo-player--visualizer)
+    (ignore-errors
+      (bongo-visualizer-render-frame bongo-player--visualizer))
     (bongo-player--sync-canvas)))
 
 (defun bongo-player--teardown-visualizer ()
@@ -341,14 +337,11 @@ when the player is turned off."
   (when bongo-player--visualizer-timer
     (cancel-timer bongo-player--visualizer-timer)
     (setq bongo-player--visualizer-timer nil))
-  (when (and bongo-player--canvas bongo-player--canvas-owner)
-    (ignore-errors (bongo-visualizer--stop-pcm))
-    (image-flush bongo-player--canvas t))
-  (setq bongo-player--canvas nil
-        bongo-player--canvas-owner nil)
-  (when bongo-player--visualizer-mode-was-on
-    (setq bongo-player--visualizer-mode-was-on nil)
-    (bongo-visualizer-mode 1)))
+  (when bongo-player--visualizer
+    (ignore-errors
+      (bongo-visualizer--destroy-view bongo-player--visualizer))
+    (setq bongo-player--visualizer nil))
+  (setq bongo-player--canvas nil))
 
 
 ;;;; The header line buttons

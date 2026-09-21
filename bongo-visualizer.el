@@ -50,7 +50,9 @@
 ;; The visualizer follows whichever Bongo playlist buffer has an active
 ;; player.  By default it is shown in the mode line of every buffer (see
 ;; `bongo-visualizer-display'); set that to `side-window' to put it in a
-;; dedicated buffer at the bottom of the frame instead.
+;; dedicated buffer at the bottom of the frame instead.  The player
+;; buffer of `bongo-player-mode' draws its own, independent view, so the
+;; two do not share a canvas and can run at the same time.
 ;;
 ;; The colours come from `bongo-visualizer-theme'; use
 ;; `bongo-visualizer-cycle-theme' to step through the built-in themes or
@@ -94,7 +96,7 @@ resolves the build symlink back into the package checkout."
 ;; Provided at runtime by the optional C module (see the Makefile).
 (declare-function bongo-vis-render "bongo-visualizer-module"
                   (canvas samples width height rate time &optional style
-                          transparent))
+                          transparent theme slot))
 (declare-function bongo-vis-reset "bongo-visualizer-module" ())
 (declare-function bongo-vis-spectrum "bongo-visualizer-module"
                   (samples rate bins))
@@ -447,32 +449,46 @@ The order of the components is documented in
 
 (defvar bongo-visualizer-mode)  ; defined by `define-minor-mode' below
 
-(defvar bongo-visualizer--canvas nil
-  "The canvas image object.")
-(defvar bongo-visualizer--width nil
-  "Width in pixels of the current canvas.")
-(defvar bongo-visualizer--height nil
-  "Height in pixels of the current canvas.")
-(defvar bongo-visualizer--data nil
-  "The ARGB32 pixel vector of the canvas.")
-(defvar bongo-visualizer--background-vector nil
-  "Pristine background pixels, copied at the start of every frame.")
-(defvar bongo-visualizer--buffer nil
-  "Buffer displaying the canvas.")
+(cl-defstruct (bongo-visualizer--view
+               (:constructor bongo-visualizer--make-view)
+               (:copier nil))
+  "State of one visualizer canvas.
+A view owns its image, dimensions, background, colour snapshot and
+smoothing state, so the mode-line visualizer and the player-buffer
+visualizer do not share anything but the decoded audio."
+  (slot 0 :type integer)
+  (display 'mode-line :type symbol)
+  canvas
+  width
+  height
+  data
+  background
+  gradient
+  peak-color
+  c-theme
+  current-theme
+  levels
+  peaks
+  buffer)
+
+(defvar bongo-visualizer--views nil
+  "List of visualizer views that currently own a canvas.")
+(defvar bongo-visualizer--mode-line-view nil
+  "The view shown by `bongo-visualizer-mode', or nil.")
 (defvar bongo-visualizer--timer nil
-  "Repeating timer driving the animation.")
-(defvar bongo-visualizer--levels nil
-  "List of smoothed bar levels, each between 0.0 and 1.0.")
-(defvar bongo-visualizer--peaks nil
-  "List of falling peak positions.")
-(defvar bongo-visualizer--gradient nil
-  "Vector mapping a row offset to its bar gradient color.")
-(defvar bongo-visualizer--peak-color nil
-  "Color of the falling peak caps in the pure-Lisp renderer.")
-(defvar bongo-visualizer--c-theme nil
-  "Flat float vector describing the current theme for the C module.")
-(defvar bongo-visualizer--current-theme nil
-  "Theme the canvas was built for; used to notice theme changes.")
+  "Repeating timer driving the animation of the mode-line view.")
+
+(defun bongo-visualizer--free-slot ()
+  "Return the lowest C module slot not used by a live view."
+  (let ((used (mapcar #'bongo-visualizer--view-slot bongo-visualizer--views)))
+    (or (cl-find-if-not (lambda (slot) (memq slot used)) '(0 1))
+        0)))
+
+(defun bongo-visualizer--new-view (display)
+  "Create a visualizer view for DISPLAY."
+  (bongo-visualizer--make-view
+   :display display
+   :slot (bongo-visualizer--free-slot)))
 
 
 ;;;; PCM source
@@ -677,11 +693,12 @@ the bins we actually display."
     (cl-mapcar (lambda (n o) (max n (* o bongo-visualizer-decay)))
                new old)))
 
-(defun bongo-visualizer--track-peaks (levels)
-  "Update and return falling peak positions for LEVELS."
-  (let ((old bongo-visualizer--peaks)
-        (height (or bongo-visualizer--height bongo-visualizer-height)))
-    (setq bongo-visualizer--peaks
+(defun bongo-visualizer--track-peaks (levels view)
+  "Update and return falling peak positions for LEVELS in VIEW."
+  (let ((old (bongo-visualizer--view-peaks view))
+        (height (or (bongo-visualizer--view-height view)
+                    bongo-visualizer-height)))
+    (setf (bongo-visualizer--view-peaks view)
           (cl-mapcar (lambda (level peak)
                        (let ((peak (or peak 0.0)))
                          (cond ((>= level peak) level)
@@ -705,22 +722,24 @@ the bins we actually display."
             height
           (frame-char-height)))))
 
-(defun bongo-visualizer--setup-canvas ()
-  "Create the canvas image and its background vector."
+(defun bongo-visualizer--setup-canvas (view)
+  "Create the canvas image and its background vector for VIEW."
   ;; Drop the previous canvas from the frame image caches, so that its
   ;; image object and pixmap are freed instead of lingering as long as
   ;; the frame lives.
-  (when bongo-visualizer--canvas
-    (image-flush bongo-visualizer--canvas t))
+  (when (bongo-visualizer--view-canvas view)
+    (image-flush (bongo-visualizer--view-canvas view) t))
   (let* ((scale (if (and (numberp bongo-visualizer-scale)
                          (> bongo-visualizer-scale 0))
                     bongo-visualizer-scale
                   1.0))
-         (width (if (eq bongo-visualizer-display 'mode-line)
+         (mode-line (eq (bongo-visualizer--view-display view) 'mode-line))
+         (width (if mode-line
                     (round (/ bongo-visualizer-mode-line-width scale))
                   bongo-visualizer-width))
-         (height (if (eq bongo-visualizer-display 'mode-line)
-                     (round (/ (bongo-visualizer--mode-line-canvas-height) scale))
+         (height (if mode-line
+                     (round (/ (bongo-visualizer--mode-line-canvas-height)
+                               scale))
                    bongo-visualizer-height))
          (background-color (if bongo-visualizer-transparent-background
                                (bongo-visualizer--argb 0 0 0 1)
@@ -735,41 +754,68 @@ the bins we actually display."
       (when (zerop (mod i (max 1 (/ height 4))))
         (dotimes (x width)
           (aset background (+ (* i width) x) grid-color))))
-    (setq bongo-visualizer--width width
-          bongo-visualizer--height height
-          bongo-visualizer--background-vector background
-          bongo-visualizer--gradient
-          (bongo-visualizer--theme-gradient-vector height)
-          bongo-visualizer--peak-color (bongo-visualizer--theme-argb :caps)
-          bongo-visualizer--c-theme (bongo-visualizer--theme-vector)
-          bongo-visualizer--current-theme bongo-visualizer-theme
-          bongo-visualizer--canvas
-          ;; Do not pass an explicit `:id': `create-image' gives each
-          ;; canvas a unique id, so a canvas recreated later can never
-          ;; alias a cached one in the frame image cache.
-          (create-image (copy-sequence background) 'canvas t
-                        :data-width width
-                        :data-height height
-                        :scale bongo-visualizer-scale
-                        :ascent bongo-visualizer-ascent)
-          bongo-visualizer--data
-          (plist-get (cdr bongo-visualizer--canvas) :data)
-          bongo-visualizer--levels nil
-          bongo-visualizer--peaks nil)))
+    ;; Do not pass an explicit `:id': `create-image' gives each canvas a
+    ;; unique id, so a canvas recreated later can never alias a cached
+    ;; one in the frame image cache.
+    (let ((canvas (create-image (copy-sequence background) 'canvas t
+                                :data-width width
+                                :data-height height
+                                :scale bongo-visualizer-scale
+                                :ascent bongo-visualizer-ascent)))
+      (setf (bongo-visualizer--view-width view) width
+            (bongo-visualizer--view-height view) height
+            (bongo-visualizer--view-background view) background
+            (bongo-visualizer--view-gradient view)
+            (bongo-visualizer--theme-gradient-vector height)
+            (bongo-visualizer--view-peak-color view)
+            (bongo-visualizer--theme-argb :caps)
+            (bongo-visualizer--view-c-theme view)
+            (bongo-visualizer--theme-vector)
+            (bongo-visualizer--view-current-theme view) bongo-visualizer-theme
+            (bongo-visualizer--view-canvas view) canvas
+            (bongo-visualizer--view-data view) (plist-get (cdr canvas) :data)
+            (bongo-visualizer--view-levels view) nil
+            (bongo-visualizer--view-peaks view) nil))
+    (cl-pushnew view bongo-visualizer--views :test #'eq)))
+
+(defun bongo-visualizer--refresh-view (view)
+  "Refresh the display that shows VIEW's canvas after a rebuild."
+  (if (eq (bongo-visualizer--view-display view) 'mode-line)
+      (force-mode-line-update t)
+    (let ((buffer (bongo-visualizer--view-buffer view)))
+      (when (and buffer (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert (propertize " " 'display
+                                (bongo-visualizer--view-canvas view)))
+            (insert "\n")
+            (goto-char (point-min))))))))
 
 (defun bongo-visualizer--apply-theme-change ()
-  "Rebuild the canvas for the current theme and refresh its display."
-  (bongo-visualizer--setup-canvas)
-  (if (eq bongo-visualizer-display 'mode-line)
-      (force-mode-line-update t)
-    (when (and bongo-visualizer--buffer
-               (buffer-live-p bongo-visualizer--buffer))
-      (with-current-buffer bongo-visualizer--buffer
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert (propertize " " 'display bongo-visualizer--canvas))
-          (insert "\n")
-          (goto-char (point-min)))))))
+  "Rebuild every live canvas for the current theme."
+  (dolist (view bongo-visualizer--views)
+    (bongo-visualizer--setup-canvas view)
+    (bongo-visualizer--refresh-view view)))
+
+(defun bongo-visualizer--destroy-view (view)
+  "Release VIEW: flush its canvas, kill its buffer and unregister it.
+When no view remains, also stop the PCM decoder and forget the C
+module state."
+  (when view
+    (when (bongo-visualizer--view-canvas view)
+      (image-flush (bongo-visualizer--view-canvas view) t))
+    (let ((buffer (bongo-visualizer--view-buffer view)))
+      (when (and buffer (buffer-live-p buffer))
+        (kill-buffer buffer)))
+    (setf (bongo-visualizer--view-canvas view) nil
+          (bongo-visualizer--view-data view) nil
+          (bongo-visualizer--view-buffer view) nil)
+    (setq bongo-visualizer--views (delq view bongo-visualizer--views))
+    (unless bongo-visualizer--views
+      (bongo-visualizer--stop-pcm)
+      (when (fboundp 'bongo-vis-reset)
+        (bongo-vis-reset)))))
 
 (defun bongo-visualizer-cycle-theme (&optional n)
   "Switch to the next visualizer color theme.
@@ -781,7 +827,7 @@ backwards."
          (index (or (cl-position bongo-visualizer-theme ids) 0))
          (next (nth (% (+ index step) (length ids)) ids)))
     (setq bongo-visualizer-theme next)
-    (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+    (when bongo-visualizer--views
       (bongo-visualizer--apply-theme-change))
     (message "Bongo visualizer theme: %s"
              (plist-get (bongo-visualizer--theme next) :label))))
@@ -799,27 +845,29 @@ Interactively, prompt for one of `bongo-visualizer-themes'."
                    bongo-visualizer-themes)
            nil t))))
   (setq bongo-visualizer-theme theme)
-  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
+  (when bongo-visualizer--views
     (bongo-visualizer--apply-theme-change))
   (message "Bongo visualizer theme: %s"
            (plist-get (bongo-visualizer--theme theme) :label)))
 
-(defun bongo-visualizer--render (levels)
-  "Paint LEVELS onto the canvas and refresh it."
-  (when (and bongo-visualizer--canvas bongo-visualizer--data)
-    (let* ((width (or bongo-visualizer--width bongo-visualizer-width))
-           (height (or bongo-visualizer--height bongo-visualizer-height))
-           (bands (max 1 (length levels)))
-           (bar-width (max 1 (/ width bands)))
-           (gap (if (>= bar-width 4) 1 0))
-           (smooth-levels levels))
-      ;; Start from a pristine background: this is a C-level vector copy,
-      ;; much faster than clearing pixel by pixel from Lisp.
-      (setq bongo-visualizer--data
-            (copy-sequence bongo-visualizer--background-vector))
-      (plist-put (cdr bongo-visualizer--canvas)
-                 :data bongo-visualizer--data)
-      (let ((data bongo-visualizer--data))
+(defun bongo-visualizer--render (levels view)
+  "Paint LEVELS onto VIEW's canvas and refresh it."
+  (let ((canvas (bongo-visualizer--view-canvas view))
+        (data (bongo-visualizer--view-data view)))
+    (when (and canvas data)
+      (let* ((width (or (bongo-visualizer--view-width view)
+                        bongo-visualizer-width))
+             (height (or (bongo-visualizer--view-height view)
+                         bongo-visualizer-height))
+             (bands (max 1 (length levels)))
+             (bar-width (max 1 (/ width bands)))
+             (gap (if (>= bar-width 4) 1 0))
+             (smooth-levels levels))
+        ;; Start from a pristine background: this is a C-level vector
+        ;; copy, much faster than clearing pixel by pixel from Lisp.
+        (setq data (copy-sequence (bongo-visualizer--view-background view)))
+        (setf (bongo-visualizer--view-data view) data)
+        (plist-put (cdr canvas) :data data)
         (cl-loop for level in smooth-levels
                  for band from 0
                  for x0 = (* band bar-width)
@@ -832,17 +880,23 @@ Interactively, prompt for one of `bongo-visualizer-themes'."
                           (dotimes (dy bar-height)
                             (let ((y (- height 1 dy)))
                               (aset data (+ (* y width) x)
-                                    (aref bongo-visualizer--gradient dy))))
+                                    (aref (bongo-visualizer--view-gradient view)
+                                          dy))))
                           (when bongo-visualizer-peaks
-                            (let* ((peak (or (nth band bongo-visualizer--peaks)
-                                             0.0))
+                            (let* ((peak
+                                    (or (nth band
+                                             (bongo-visualizer--view-peaks
+                                              view))
+                                        0.0))
                                    (py (- height 1
                                           (min (1- height)
-                                               (round (* peak (- height 2)))))))
+                                               (round (* peak
+                                                         (- height 2)))))))
                               (when (>= py 0)
                                 (aset data (+ (* py width) x)
-                                      bongo-visualizer--peak-color)))))))))
-      (canvas-refresh bongo-visualizer--canvas 'reload-data))))
+                                      (bongo-visualizer--view-peak-color
+                                       view)))))))))
+        (canvas-refresh canvas 'reload-data)))))
 
 
 ;;;; The frame loop
@@ -876,15 +930,17 @@ Run this once before enabling `bongo-visualizer-mode', or after editing
                                         default-directory))))))
 
 (defun bongo-visualizer-refit ()
-  "Resize the visualizer canvas to fit the current mode line.
+  "Resize the mode-line visualizer canvas to fit the mode line.
 Run this after changing the font size or the mode line height."
   (interactive)
-  (if (not bongo-visualizer-mode)
-      (message "Bongo visualizer is not enabled")
-    (bongo-visualizer--setup-canvas)
-    (force-mode-line-update t)
-    (message "Bongo visualizer: canvas is now %dx%d"
-             bongo-visualizer--width bongo-visualizer--height)))
+  (let ((view bongo-visualizer--mode-line-view))
+    (if (not (and bongo-visualizer-mode view))
+        (message "Bongo visualizer is not enabled")
+      (bongo-visualizer--setup-canvas view)
+      (bongo-visualizer--refresh-view view)
+      (message "Bongo visualizer: canvas is now %dx%d"
+               (bongo-visualizer--view-width view)
+               (bongo-visualizer--view-height view)))))
 
 (defun bongo-visualizer--load-module ()
   "Load the C module if it can be found.  Return non-nil if available."
@@ -917,8 +973,16 @@ Run this after changing the font size or the mode line height."
              (and (integerp max) (>= max 9)))
          (error nil))))
 
-(defun bongo-visualizer--module-frame (player)
-  "Render one frame with the C module for PLAYER."
+(defun bongo-visualizer--module-slot-capable-p ()
+  "Return non-nil if the loaded C module accepts a slot argument."
+  (and (fboundp 'bongo-vis-render)
+       (condition-case nil
+           (let ((max (cdr (func-arity #'bongo-vis-render))))
+             (and (integerp max) (>= max 10)))
+         (error nil))))
+
+(defun bongo-visualizer--module-frame (player view)
+  "Render one frame with the C module for PLAYER into VIEW."
   (let* ((playing (and player (not (bongo-player-paused-p player))))
          (samples
           (cond ((not playing)
@@ -929,67 +993,89 @@ Run this after changing the font size or the mode line height."
                  (bongo-visualizer--ensure-source player)
                  (or (bongo-visualizer--pcm-samples bongo-visualizer-window)
                      (make-vector bongo-visualizer-window 0.0))))))
-    ;; Older builds of the module only take eight arguments; pass the
-    ;; theme vector only when the module knows about it.
-    (apply #'bongo-vis-render
-           bongo-visualizer--canvas samples
-           (or bongo-visualizer--width bongo-visualizer-width)
-           (or bongo-visualizer--height bongo-visualizer-height)
-           (float bongo-visualizer-sample-rate)
-           (float-time)
-           bongo-visualizer-style
-           bongo-visualizer-transparent-background
-           (when (bongo-visualizer--module-theme-capable-p)
-             (list bongo-visualizer--c-theme)))))
+    ;; Older builds of the module take only eight or nine arguments; pass
+    ;; the theme and the slot only when the module knows about them.
+    (let ((optional
+           (cond ((and (bongo-visualizer--module-theme-capable-p)
+                       (bongo-visualizer--module-slot-capable-p))
+                  (list (bongo-visualizer--view-c-theme view)
+                        (bongo-visualizer--view-slot view)))
+                 ((bongo-visualizer--module-theme-capable-p)
+                  (list (bongo-visualizer--view-c-theme view))))))
+      (apply #'bongo-vis-render
+             (bongo-visualizer--view-canvas view) samples
+             (or (bongo-visualizer--view-width view) bongo-visualizer-width)
+             (or (bongo-visualizer--view-height view)
+                 bongo-visualizer-height)
+             (float bongo-visualizer-sample-rate)
+             (float-time)
+             bongo-visualizer-style
+             bongo-visualizer-transparent-background
+             optional))))
 
-(defun bongo-visualizer-render-frame ()
-  "Render one visualizer frame into `bongo-visualizer--canvas'.
-Unlike `bongo-visualizer--frame', this does not check
+(defun bongo-visualizer-render-frame (&optional view)
+  "Render one visualizer frame into VIEW.
+VIEW defaults to `bongo-visualizer--mode-line-view'.  Unlike
+`bongo-visualizer--frame', this does not check
 `bongo-visualizer-mode', so a front end such as `bongo-player-mode'
-can drive the canvas even when the visualizer's own display is off."
-  (when bongo-visualizer--canvas
-    ;; Notice a theme change made with `setq' and rebuild the canvas so
-    ;; that the background and the Lisp gradient follow it too.
-    (unless (eq bongo-visualizer-theme bongo-visualizer--current-theme)
-      (bongo-visualizer--apply-theme-change))
-    (let ((player (bongo-visualizer--player)))
-      (pcase (bongo-visualizer--renderer)
-        ('module (bongo-visualizer--module-frame player))
-        (_ (bongo-visualizer--frame-lisp player))))))
+can drive its own view even when the visualizer's display is off."
+  (let ((view (or view bongo-visualizer--mode-line-view)))
+    (when (and view (bongo-visualizer--view-canvas view))
+      ;; Notice a theme change made with `setq' and rebuild the canvas so
+      ;; that the background and the Lisp gradient follow it too.
+      (unless (eq bongo-visualizer-theme
+                  (bongo-visualizer--view-current-theme view))
+        (bongo-visualizer--setup-canvas view)
+        (bongo-visualizer--refresh-view view))
+      (let ((player (bongo-visualizer--player)))
+        (pcase (bongo-visualizer--renderer)
+          ('module (bongo-visualizer--module-frame player view))
+          (_ (bongo-visualizer--frame-lisp player view)))))))
 
 (defun bongo-visualizer--frame ()
   "Advance the animation by one frame."
   (when bongo-visualizer-mode
-    (bongo-visualizer-render-frame)))
+    (bongo-visualizer-render-frame bongo-visualizer--mode-line-view)))
 
 (defun bongo-visualizer--renderer ()
-  "Return the renderer to use: `module' or `lisp'."
+  "Return the renderer to use: `module' or `lisp'.
+When the loaded C module cannot keep separate state per canvas, two
+live views would reset each other's smoothing, so fall back to the
+Lisp renderer while more than one view is active."
   (pcase bongo-visualizer-renderer
     ('module 'module)
     ('lisp 'lisp)
-    (_ (if (bongo-visualizer--module-active-p) 'module 'lisp))))
+    (_ (if (and (bongo-visualizer--module-active-p)
+                (or (bongo-visualizer--module-slot-capable-p)
+                    (null (cdr bongo-visualizer--views))))
+           'module
+         'lisp))))
 
-(defun bongo-visualizer--frame-lisp (player)
-  "Pure-Lisp frame rendering for PLAYER, when the C module is unavailable."
+(defun bongo-visualizer--frame-lisp (player view)
+  "Pure-Lisp frame rendering for PLAYER into VIEW."
   (let ((active (and player
                      (not (bongo-player-paused-p player)))))
     (if active
         (progn
           (bongo-visualizer--ensure-source player)
-          (setq bongo-visualizer--levels
-                (bongo-visualizer--smooth (bongo-visualizer--compute-levels)
-                                          bongo-visualizer--levels))
-          (bongo-visualizer--track-peaks bongo-visualizer--levels))
-      (setq bongo-visualizer--levels
+          (setf (bongo-visualizer--view-levels view)
+                (bongo-visualizer--smooth
+                 (bongo-visualizer--compute-levels)
+                 (bongo-visualizer--view-levels view)))
+          (bongo-visualizer--track-peaks (bongo-visualizer--view-levels view)
+                                         view))
+      (setf (bongo-visualizer--view-levels view)
             (mapcar (lambda (level) (* level 0.9))
-                    (or bongo-visualizer--levels
+                    (or (bongo-visualizer--view-levels view)
                         (make-list bongo-visualizer-bands 0.0))))
-      (setq bongo-visualizer--peaks
+      (setf (bongo-visualizer--view-peaks view)
             (mapcar (lambda (peak) (* peak 0.9))
-                    (or bongo-visualizer--peaks
+                    (or (bongo-visualizer--view-peaks view)
                         (make-list bongo-visualizer-bands 0.0)))))
-    (bongo-visualizer--render (or bongo-visualizer--levels
-                                  (make-list bongo-visualizer-bands 0.0)))))
+    (bongo-visualizer--render
+     (or (bongo-visualizer--view-levels view)
+         (make-list bongo-visualizer-bands 0.0))
+     view)))
 
 (defun bongo-visualizer--sync-source (&rest _)
   "Restart the PCM decoder for the new track, if any."
@@ -1010,9 +1096,12 @@ can drive the canvas even when the visualizer's own display is off."
 
 (defun bongo-visualizer--mode-line ()
   "Return the mode line construct for the visualizer canvas."
-  (when (and bongo-visualizer-mode bongo-visualizer--canvas)
-    (propertize " " 'display bongo-visualizer--canvas
-                'help-echo "Bongo visualizer")))
+  (let ((view bongo-visualizer--mode-line-view))
+    (when (and bongo-visualizer-mode view)
+      (let ((canvas (bongo-visualizer--view-canvas view)))
+        (when canvas
+          (propertize " " 'display canvas
+                      'help-echo "Bongo visualizer"))))))
 
 (defun bongo-visualizer--show-mode-line (show)
   "Add the visualizer to the global mode line when SHOW is non-nil."
@@ -1027,29 +1116,32 @@ can drive the canvas even when the visualizer's own display is off."
       (setq global-mode-string
             (delete bongo-visualizer--mode-line-entry global-mode-string)))))
 
-(defun bongo-visualizer--setup-buffer ()
-  "Create and display the visualizer buffer."
-  (setq bongo-visualizer--buffer
-        (get-buffer-create bongo-visualizer-buffer-name))
-  (with-current-buffer bongo-visualizer--buffer
-    (setq buffer-read-only nil)
-    (erase-buffer)
-    (insert (propertize " " 'display bongo-visualizer--canvas))
-    (insert "\n")
-    (goto-char (point-min))
-    (setq-local cursor-type nil)
-    (setq-local truncate-lines t)
-    (setq-local mode-line-format nil)
-    (setq buffer-read-only t))
-  (when bongo-visualizer-side
-    (display-buffer
-     bongo-visualizer--buffer
-     `(display-buffer-in-side-window
-       (side . ,bongo-visualizer-side)
-       (slot . 0)
-       (window-height . ,(1+ (ceiling (/ (or bongo-visualizer--height
-                                             bongo-visualizer-height)
-                                         (float (frame-char-height))))))))))
+(defun bongo-visualizer--setup-buffer (view)
+  "Create and display the buffer showing VIEW's canvas."
+  (let ((buffer (get-buffer-create bongo-visualizer-buffer-name)))
+    (setf (bongo-visualizer--view-buffer view) buffer)
+    (with-current-buffer buffer
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (propertize " " 'display
+                          (bongo-visualizer--view-canvas view)))
+      (insert "\n")
+      (goto-char (point-min))
+      (setq-local cursor-type nil)
+      (setq-local truncate-lines t)
+      (setq-local mode-line-format nil)
+      (setq buffer-read-only t))
+    (when bongo-visualizer-side
+      (display-buffer
+       buffer
+       `(display-buffer-in-side-window
+         (side . ,bongo-visualizer-side)
+         (slot . 0)
+         (window-height
+          . ,(1+ (ceiling
+                  (/ (or (bongo-visualizer--view-height view)
+                         bongo-visualizer-height)
+                     (float (frame-char-height)))))))))))
 
 ;;;###autoload
 (define-minor-mode bongo-visualizer-mode
@@ -1062,12 +1154,12 @@ playlist buffer currently has an active player."
   (if bongo-visualizer-mode
       (progn
         (bongo-visualizer--load-module)
-        (when (fboundp 'bongo-vis-reset)
-          (bongo-vis-reset))
-        (bongo-visualizer--setup-canvas)
+        (setq bongo-visualizer--mode-line-view
+              (bongo-visualizer--new-view bongo-visualizer-display))
+        (bongo-visualizer--setup-canvas bongo-visualizer--mode-line-view)
         (if (eq bongo-visualizer-display 'mode-line)
             (bongo-visualizer--show-mode-line t)
-          (bongo-visualizer--setup-buffer))
+          (bongo-visualizer--setup-buffer bongo-visualizer--mode-line-view))
         (add-hook 'bongo-player-started-hook #'bongo-visualizer--sync-source)
         (add-hook 'bongo-player-sought-hook #'bongo-visualizer--sync-source)
         (setq bongo-visualizer--timer
@@ -1079,17 +1171,9 @@ playlist buffer currently has an active player."
     (remove-hook 'bongo-player-started-hook #'bongo-visualizer--sync-source)
     (remove-hook 'bongo-player-sought-hook #'bongo-visualizer--sync-source)
     (bongo-visualizer--show-mode-line nil)
-    (bongo-visualizer--stop-pcm)
-    (when (fboundp 'bongo-vis-reset)
-      (bongo-vis-reset))
-    (when (and bongo-visualizer--buffer
-               (buffer-live-p bongo-visualizer--buffer))
-      (kill-buffer bongo-visualizer--buffer))
-    (when bongo-visualizer--canvas
-      (image-flush bongo-visualizer--canvas t))
-    (setq bongo-visualizer--buffer nil
-          bongo-visualizer--canvas nil
-          bongo-visualizer--data nil)))
+    (when bongo-visualizer--mode-line-view
+      (bongo-visualizer--destroy-view bongo-visualizer--mode-line-view)
+      (setq bongo-visualizer--mode-line-view nil))))
 
 
 (provide 'bongo-visualizer)

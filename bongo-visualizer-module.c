@@ -27,7 +27,9 @@ Call:   (bongo-vis-render CANVAS SAMPLES WIDTH HEIGHT TIME STYLE)
         TRANSPARENT leaves the background transparent.  Optional THEME
         is a flat float vector of colours, in the order documented in
         `bongo-visualizer-themes'; without it a pink phosphor scheme is
-        used.
+        used.  Optional SLOT (0 or 1) selects independent persistent
+        state, so two canvases can be animated alternately without
+        resetting each other's smoothing and allocation.
 */
 
 #include <emacs-module.h>
@@ -77,7 +79,26 @@ default_theme (double *th)
 }
 
 /* ------------------------------------------------------------------ */
-/* Persistent scratch state (one visualizer, one canvas).              */
+/* Persistent scratch state.                                           */
+/*                                                                     */
+/* Each canvas gets a slot so that two visualizers, say the mode-line  */
+/* one and the player-buffer one, can be animated alternately without  */
+/* resetting the other's levels, peaks and allocation.  The globals    */
+/* below always mirror the currently loaded slot; `select_slot' saves  */
+/* them back before switching.                                         */
+
+enum { VIS_SLOTS = 2 };
+
+typedef struct
+{
+  int W, H, N;
+  double *levels, *peaks;
+  double *fre, *fim, *hann, *mag;
+  float *acc, *bloom, *tmp;
+} vis_state;
+
+static vis_state slots[VIS_SLOTS];
+static int loaded_slot = -1;
 
 static int W = 0, H = 0;          /* canvas dimensions                    */
 static int N = 0;                 /* current FFT size (power of two)      */
@@ -92,14 +113,58 @@ static float *bloom = NULL;       /* bloom scratch                        */
 static float *tmp = NULL;         /* blur scratch                         */
 
 static void
-free_state (void)
+save_state (vis_state *st)
 {
-  free (levels); free (peaks);
-  free (fre); free (fim); free (hann); free (mag);
-  free (acc); free (bloom); free (tmp);
+  st->W = W; st->H = H; st->N = N;
+  st->levels = levels; st->peaks = peaks;
+  st->fre = fre; st->fim = fim; st->hann = hann; st->mag = mag;
+  st->acc = acc; st->bloom = bloom; st->tmp = tmp;
+}
+
+static void
+load_state (const vis_state *st)
+{
+  W = st->W; H = st->H; N = st->N;
+  levels = st->levels; peaks = st->peaks;
+  fre = st->fre; fim = st->fim; hann = st->hann; mag = st->mag;
+  acc = st->acc; bloom = st->bloom; tmp = st->tmp;
+}
+
+static void
+select_slot (int slot)
+{
+  if (slot < 0 || slot >= VIS_SLOTS)
+    slot = 0;
+  if (slot == loaded_slot)
+    return;
+  if (loaded_slot >= 0)
+    save_state (&slots[loaded_slot]);
+  load_state (&slots[slot]);
+  loaded_slot = slot;
+}
+
+static void
+free_slot (vis_state *st)
+{
+  free (st->levels); free (st->peaks);
+  free (st->fre); free (st->fim); free (st->hann); free (st->mag);
+  free (st->acc); free (st->bloom); free (st->tmp);
+  memset (st, 0, sizeof *st);
+}
+
+static void
+reset_all (void)
+{
+  if (loaded_slot >= 0)
+    {
+      save_state (&slots[loaded_slot]);
+      loaded_slot = -1;
+    }
+  for (int i = 0; i < VIS_SLOTS; i++)
+    free_slot (&slots[i]);
+  W = H = N = 0;
   levels = peaks = fre = fim = hann = mag = NULL;
   acc = bloom = tmp = NULL;
-  W = H = N = 0;
 }
 
 static bool
@@ -553,6 +618,7 @@ Fbongo_vis_render (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
   double time = env->extract_float (env, args[5]);
   int style = (nargs > 6) ? (int) env->extract_integer (env, args[6]) : 0;
   bool transparent = (nargs > 7) && env->is_not_nil (env, args[7]);
+  int slot = (nargs > 9) ? (int) env->extract_integer (env, args[9]) : 0;
 
   if (env->non_local_exit_check (env) != emacs_funcall_exit_return)
     return env->intern (env, "nil");
@@ -593,6 +659,7 @@ Fbongo_vis_render (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
     return env->intern (env, "nil");
 
   /* Set up the per-canvas and per-FFT scratch before rendering.  */
+  select_slot (slot);
   int n = 32;
   while (n * 2 <= nsamp && n < 4096)
     n <<= 1;
@@ -674,6 +741,7 @@ Fbongo_vis_spectrum (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
   if (bins < 1) bins = 1;
   if (bins > 4096) bins = 4096;
 
+  select_slot (0);
   ptrdiff_t nsamp = 0;
   double *s = extract_samples (env, args[0], &nsamp);
   if (!s)
@@ -729,6 +797,7 @@ Fbongo_vis_waveform (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
   if (bins < 1) bins = 1;
   if (bins > 4096) bins = 4096;
 
+  select_slot (0);
   ptrdiff_t nsamp = 0;
   double *s = extract_samples (env, args[0], &nsamp);
   if (!s)
@@ -768,7 +837,7 @@ Fbongo_vis_reset (emacs_env *env, ptrdiff_t nargs, emacs_value *args,
                   void *data)
 {
   (void) nargs; (void) args; (void) data;
-  free_state ();
+  reset_all ();
   return env->intern (env, "nil");
 }
 
@@ -789,7 +858,7 @@ emacs_module_init (struct emacs_runtime *ert)
 {
   emacs_env *env = ert->get_environment (ert);
 
-  define (env, "bongo-vis-render", 6, 9, Fbongo_vis_render,
+  define (env, "bongo-vis-render", 6, 10, Fbongo_vis_render,
           "Render one visualizer frame into CANVAS.\n"
           "SAMPLES is a vector of floats in [-1, 1],\n"
           "WIDTH and HEIGHT are the canvas dimensions, RATE is the\n"
@@ -797,7 +866,9 @@ emacs_module_init (struct emacs_runtime *ert)
           "STYLE selects a look.  When TRANSPARENT is non-nil the\n"
           "background is left transparent.  THEME, when given, is a\n"
           "flat float vector of colours as documented in\n"
-          "`bongo-visualizer-themes'.");
+          "`bongo-visualizer-themes'.  SLOT, when given, selects one\n"
+          "of two independent persistent states so that two canvases\n"
+          "can be animated alternately.");
   define (env, "bongo-vis-pixel", 4, 4, Fbongo_vis_pixel,
           "Return the ARGB pixel at X, Y in CANVAS of WIDTH (debug helper).\n"
           "\n(fn CANVAS X Y WIDTH)");
