@@ -5114,7 +5114,10 @@ By ``one of the times'' is meant elapsed time or total time.")
 
 (defun bongo-player-times-changed (player)
   "Run the hooks for when one of the times of PLAYER has changed."
-  (let ((current-seconds (cl-second (current-time))))
+  ;; Use `float-time' instead of picking apart the value returned by
+  ;; `current-time', since that value is not necessarily a list (see
+  ;; the variable `current-time-list').
+  (let ((current-seconds (floor (float-time))))
     (when (> current-seconds bongo-player-times-last-updated)
       (setq bongo-player-times-last-updated current-seconds)
       (save-current-buffer
