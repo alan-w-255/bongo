@@ -694,6 +694,11 @@ the bins we actually display."
 
 (defun bongo-visualizer--setup-canvas ()
   "Create the canvas image and its background vector."
+  ;; Drop the previous canvas from the frame image caches, so that its
+  ;; image object and pixmap are freed instead of lingering as long as
+  ;; the frame lives.
+  (when bongo-visualizer--canvas
+    (image-flush bongo-visualizer--canvas t))
   (let* ((scale (if (and (numberp bongo-visualizer-scale)
                          (> bongo-visualizer-scale 0))
                     bongo-visualizer-scale
@@ -726,12 +731,14 @@ the bins we actually display."
           bongo-visualizer--c-theme (bongo-visualizer--theme-vector)
           bongo-visualizer--current-theme bongo-visualizer-theme
           bongo-visualizer--canvas
+          ;; Do not pass an explicit `:id': `create-image' gives each
+          ;; canvas a unique id, so a canvas recreated later can never
+          ;; alias a cached one in the frame image cache.
           (create-image (copy-sequence background) 'canvas t
                         :data-width width
                         :data-height height
                         :scale bongo-visualizer-scale
-                        :ascent bongo-visualizer-ascent
-                        :id 'bongo-visualizer)
+                        :ascent bongo-visualizer-ascent)
           bongo-visualizer--data
           (plist-get (cdr bongo-visualizer--canvas) :data)
           bongo-visualizer--levels nil
@@ -1057,6 +1064,8 @@ playlist buffer currently has an active player."
     (when (and bongo-visualizer--buffer
                (buffer-live-p bongo-visualizer--buffer))
       (kill-buffer bongo-visualizer--buffer))
+    (when bongo-visualizer--canvas
+      (image-flush bongo-visualizer--canvas t))
     (setq bongo-visualizer--buffer nil
           bongo-visualizer--canvas nil
           bongo-visualizer--data nil)))
