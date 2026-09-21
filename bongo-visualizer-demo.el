@@ -94,7 +94,7 @@
   "Play a generated track and show the Bongo visualizer reacting to it."
   (interactive)
   (setq bongo-visualizer-renderer 'module
-        bongo-visualizer-source 'ffmpeg
+        bongo-visualizer-source 'mpv
         bongo-visualizer-display 'mode-line
         bongo-visualizer-style 0
         bongo-visualizer-fps 30)

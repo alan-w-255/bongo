@@ -25,9 +25,9 @@
 ;;
 ;; Where do the samples come from?  Bongo itself just launches external
 ;; players; it does not see the audio.  So this module decodes the
-;; currently playing file with ffmpeg into a PCM pipe once per track and
-;; indexes into it using `bongo-elapsed-time'.  If that is unavailable,
-;; it falls back to a procedural "demo" animation.
+;; currently playing file with `mpv --ao=pcm' into a PCM pipe once per
+;; track and indexes into it using `bongo-elapsed-time'.  If that is
+;; unavailable, it falls back to a procedural "demo" animation.
 ;;
 ;; Usage:
 ;;   M-x bongo-visualizer-build-module RET   (once, compiles the C module)
@@ -172,7 +172,7 @@ On HiDPI/Retina displays you may want 0.5 so the image is not huge."
   :type 'number)
 
 (defcustom bongo-visualizer-sample-rate 8000
-  "Sample rate used when decoding audio with ffmpeg.
+  "Sample rate used when decoding audio with mpv.
 The Nyquist frequency is half of this, and is the highest band."
   :type 'integer)
 
@@ -182,11 +182,11 @@ Bigger is more frequency-selective but slower: the Goertzel loop runs
 `bands' times over this many samples on every frame."
   :type 'integer)
 
-(defcustom bongo-visualizer-source 'ffmpeg
+(defcustom bongo-visualizer-source 'mpv
   "Where the visualizer gets its data from.
-`ffmpeg' decodes the playing file to PCM and computes a real spectrum.
-`demo' ignores the audio and draws a procedural animation."
-  :type '(choice (const :tag "Decode with ffmpeg" ffmpeg)
+`mpv' decodes the playing file with `--ao=pcm' and computes a real
+spectrum.  `demo' ignores the audio and draws a procedural animation."
+  :type '(choice (const :tag "Decode with mpv" mpv)
                  (const :tag "Procedural demo" demo)))
 
 (defcustom bongo-visualizer-use-module t
@@ -218,18 +218,22 @@ oscilloscope), a spectrum (the rainbow analyser wings), or both."
                  (const :tag "C software renderer" module)
                  (const :tag "Pure Lisp" lisp)))
 
-(defcustom bongo-visualizer-ffmpeg-program "ffmpeg"
-  "Name of the ffmpeg executable."
+(defcustom bongo-visualizer-mpv-program "mpv"
+  "Name of the mpv executable."
   :type 'string)
 
-(defcustom bongo-visualizer-ffmpeg-arguments '("-v" "error" "-nostdin")
-  "Arguments passed to ffmpeg before `-i FILE'."
+(defcustom bongo-visualizer-mpv-arguments
+  '("--no-config" "--no-video" "--really-quiet")
+  "Arguments passed to mpv before the format options and FILE.
+`--no-config' must stay first for it to take effect; it keeps the
+user's configuration from interfering with this background decoder,
+for example by making it claim the player's IPC socket."
   :type '(repeat string))
 
 (defcustom bongo-visualizer-latency 0.15
   "How many seconds to look behind the reported playback time.
 Compensates for the delay between `bongo-elapsed-time' and what you
-actually hear, and makes sure ffmpeg has decoded that far."
+actually hear, and makes sure mpv has decoded that far."
   :type 'number)
 
 (defcustom bongo-visualizer-decay 0.80
@@ -476,7 +480,7 @@ The order of the components is documented in
 (defvar bongo-visualizer--pcm-buffer nil
   "Unibyte buffer accumulating raw little-endian s16 samples.")
 (defvar bongo-visualizer--pcm-process nil
-  "The ffmpeg decoding process.")
+  "The mpv decoding process.")
 (defvar bongo-visualizer--current-file nil
   "File currently being decoded.")
 
@@ -502,7 +506,7 @@ The order of the components is documented in
   (setq bongo-visualizer--pcm-buffer nil))
 
 (defun bongo-visualizer--start-pcm (file)
-  "Start decoding FILE to raw PCM with ffmpeg."
+  "Start decoding FILE to raw PCM with mpv."
   (bongo-visualizer--stop-pcm)
   (let* ((rate bongo-visualizer-sample-rate)
          (buffer (generate-new-buffer " *bongo-visualizer-pcm*")))
@@ -514,18 +518,27 @@ The order of the components is documented in
       (set-buffer-multibyte nil))
     (let ((process
            (make-process
-            :name "bongo-visualizer-ffmpeg"
+            :name "bongo-visualizer-mpv"
             :buffer buffer
-            ;; Do NOT let stderr share the stdout buffer: ffmpeg writes
-            ;; diagnostics even with `-v error', and a single stray byte
-            ;; shifts every sample and destroys the spectrum.
-            :stderr (get-buffer-create " *bongo-visualizer-ffmpeg-stderr*")
-            :command (append (list bongo-visualizer-ffmpeg-program)
-                             bongo-visualizer-ffmpeg-arguments
-                             (list "-i" file
-                                   "-vn" "-ac" "1"
-                                   "-ar" (number-to-string rate)
-                                   "-f" "s16le" "-"))
+            ;; Do NOT let stderr share the stdout buffer: mpv writes
+            ;; diagnostics there even with `--really-quiet', and a single
+            ;; stray byte shifts every sample and destroys the spectrum.
+            :stderr (get-buffer-create " *bongo-visualizer-mpv-stderr*")
+            ;; mpv spells the sample format without an endianness suffix;
+            ;; s16 is little-endian, as `bongo-visualizer--pcm-samples'
+            ;; assumes, on the platforms Emacs canvas images target.
+            :command (append (list bongo-visualizer-mpv-program)
+                             bongo-visualizer-mpv-arguments
+                             (list "--ao=pcm"
+                                   "--ao-pcm-waveheader=no"
+                                   ;; mpv has no `-' convention here; this
+                                   ;; streams the PCM to stdout on POSIX.
+                                   "--ao-pcm-file=/dev/stdout"
+                                   "--audio-format=s16"
+                                   (format "--audio-samplerate=%d" rate)
+                                   "--audio-channels=mono"
+                                   "--"
+                                   file))
             :coding 'no-conversion
             :connection-type 'pipe
             :sentinel #'ignore
@@ -536,14 +549,14 @@ The order of the components is documented in
 
 (defun bongo-visualizer--ensure-source (player)
   "Make sure the PCM source matches what PLAYER is playing."
-  (when (eq bongo-visualizer-source 'ffmpeg)
+  (when (eq bongo-visualizer-source 'mpv)
     (let ((file (ignore-errors (bongo-player-file-name player))))
       (when (and (stringp file)
                  (not (equal file bongo-visualizer--current-file)))
         (condition-case err
             (bongo-visualizer--start-pcm file)
           (error
-           (message "bongo-visualizer: ffmpeg failed: %s"
+           (message "bongo-visualizer: mpv failed: %s"
                     (error-message-string err))))))))
 
 (defun bongo-visualizer--pcm-samples (n)
@@ -981,7 +994,7 @@ can drive the canvas even when the visualizer's own display is off."
 (defun bongo-visualizer--sync-source (&rest _)
   "Restart the PCM decoder for the new track, if any."
   (when (and bongo-visualizer-mode
-             (eq bongo-visualizer-source 'ffmpeg)
+             (eq bongo-visualizer-source 'mpv)
              bongo-player)
     (let ((file (ignore-errors (bongo-player-file-name bongo-player))))
       (when (and (stringp file)
