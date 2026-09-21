@@ -24,13 +24,19 @@
 ;;; Commentary:
 
 ;; `bongo-player-mode' shows a single, self-contained player buffer for
-;; the track playing in Bongo.  The buffer holds, from top to bottom:
+;; the track playing in Bongo.  The layout is:
 ;;
-;;   - the album cover and the track information,
-;;   - the visualizer canvas from `bongo-visualizer',
-;;   - a text progress bar with the elapsed and total time,
-;;   - a row of widget push-buttons for common actions,
-;;   - a fixed viewport of scrolling lyrics.
+;;   - the buffer header line holds the track title on the left and a
+;;     row of widget push-buttons for common actions on the right,
+;;   - the buffer body holds the track information, the visualizer
+;;     canvas and a fixed viewport of scrolling lyrics,
+;;   - the buffer mode line holds the progress bar, drawn as a canvas
+;;     image with the elapsed and total time.  The progress bar is
+;;     buffer-local, so it only appears in the player buffer.
+;;
+;; Widget buttons need buffer text to live in, which a header line
+;; cannot provide; they are rendered with the widget faces and their
+;; clicks are dispatched through a keymap attached to the header line.
 ;;
 ;; The lyrics do not scroll the window: the player window stays at the
 ;; top of the buffer and the lyric viewport is redrawn in place.  Within
@@ -116,8 +122,8 @@ One of `bottom', `top', `left' or `right'."
 
 (defcustom bongo-player-window-height 26
   "Height in lines of the player side window.
-Make this large enough for the header (cover, visualizer, progress
-bar and controls) plus `bongo-player-lyrics-lines' lyric lines."
+Make this large enough for the header (visualizer and progress bar)
+plus `bongo-player-lyrics-lines' lyric lines."
   :type 'integer
   :group 'bongo-player)
 
@@ -132,32 +138,17 @@ When nil, the lyrics jump from line to line instead."
   :type 'boolean
   :group 'bongo-player)
 
-(defcustom bongo-player-progress-width nil
-  "Width of the progress bar in columns.
-A value of nil means use the width of the player window, leaving
-room for the time display."
-  :type '(choice (const :tag "Window width" nil) integer)
-  :group 'bongo-player)
-
-(defcustom bongo-player-show-cover t
-  "Whether to show the album cover in the player buffer."
+(defcustom bongo-player-progress-bar t
+  "Whether to show a progress bar in the player mode line.
+The bar is a canvas image and only appears in the player buffer."
   :type 'boolean
   :group 'bongo-player)
 
-(defcustom bongo-player-cover-max-size 140
-  "Maximum width and height of the album cover, in pixels."
-  :type 'integer
-  :group 'bongo-player)
-
-(defcustom bongo-player-cover-directory
-  (locate-user-emacs-file "bongo-player/")
-  "Directory where covers extracted from track tags are cached."
-  :type 'directory
-  :group 'bongo-player)
-
-(defcustom bongo-player-ffmpeg-program "ffmpeg"
-  "Program used to extract cover art embedded in a track."
-  :type 'string
+(defcustom bongo-player-progress-height nil
+  "Height in pixels of the mode line progress bar.
+A value of nil falls back to `bongo-visualizer-mode-line-height',
+and to the height of the mode line when that is nil too."
+  :type '(choice (const :tag "Mode line height" nil) integer)
   :group 'bongo-player)
 
 (defcustom bongo-player-show-visualizer t
@@ -177,14 +168,23 @@ room for the time display."
 (defvar bongo-player--header-end nil
   "Marker at the end of the player header.")
 
-(defvar bongo-player--progress-start nil
-  "Marker at the start of the progress line.")
-
-(defvar bongo-player--progress-end nil
-  "Marker at the end of the progress line.")
-
 (defvar bongo-player--lyrics-start nil
   "Marker at the start of the lyrics region.")
+
+(defvar bongo-player--header-buttons nil
+  "Cached button string of the player header line.")
+
+(defvar bongo-player--progress-canvas nil
+  "Canvas image drawn in the mode line of the player buffer.")
+
+(defvar bongo-player--progress-data nil
+  "ARGB32 pixel vector of `bongo-player--progress-canvas'.")
+
+(defvar bongo-player--progress-canvas-width nil
+  "Width in pixels of `bongo-player--progress-canvas'.")
+
+(defvar bongo-player--progress-canvas-height nil
+  "Height in pixels of `bongo-player--progress-canvas'.")
 
 (defvar bongo-player--spacer nil
   "Marker on the newline of the first rendered lyric line.")
@@ -206,12 +206,6 @@ room for the time display."
 
 (defvar bongo-player--dirty t
   "Non-nil when the player buffer must be fully redrawn.")
-
-(defvar bongo-player--cover-file nil
-  "File name of the current cover image, or nil.")
-
-(defvar bongo-player--cover nil
-  "Image object of the current cover, or nil.")
 
 (defvar bongo-player--canvas nil
   "Visualizer canvas shown in the player buffer, or nil.")
@@ -259,7 +253,8 @@ room for the time display."
   (setq-local truncate-lines nil)
   (setq-local word-wrap t)
   (setq-local cursor-type nil)
-  (setq-local mode-line-format '(:eval (bongo-player--mode-line))))
+  (setq-local mode-line-format '(:eval (bongo-player--mode-line)))
+  (setq-local header-line-format '(:eval (bongo-player--header-line))))
 
 
 ;;;; Buffer and window helpers
@@ -274,82 +269,43 @@ room for the time display."
        (eq (window-buffer bongo-player--window) bongo-player--buffer)
        bongo-player--window))
 
+(defun bongo-player--progress-label ()
+  "Return the right-aligned label shown after the progress bar.
+It holds the lyrics offset when there is one, and the elapsed and
+total time of the current track."
+  (let ((total (bongo-lyrics-total-time))
+        (elapsed (or (bongo-lyrics-elapsed-time) 0.0))
+        (offset bongo-lyrics-offset))
+    (concat (when (/= offset 0.0)
+              (format "[%+g s] " offset))
+            (if (and total (> total 0.0))
+                (format "%s / %s"
+                        (bongo-format-seconds elapsed)
+                        (bongo-format-seconds total))
+              (bongo-format-seconds elapsed)))))
+
+(defun bongo-player--string-pixel-width (string &optional face)
+  "Return the pixel width of STRING as it is shown with FACE."
+  (let ((probe (copy-sequence string)))
+    (when face
+      (add-face-text-property 0 (length probe) face t probe))
+    (string-pixel-width probe (bongo-player--buffer))))
+
 (defun bongo-player--mode-line ()
-  "Return the player mode line construct."
-  (concat " " (let ((title (bongo-lyrics-title)))
-               (if (string-empty-p title) "Bongo Player" title))
-          (when (/= bongo-lyrics-offset 0.0)
-            (format " [%+g s]" bongo-lyrics-offset))))
-
-
-;;;; Album cover
-
-(defun bongo-player--local-cover (file)
-  "Return a cover image next to FILE, or nil."
-  (when (and (stringp file)
-             (not (bongo-uri-p file))
-             (file-name-absolute-p file))
-    (let ((directory (file-name-directory file))
-          (base (downcase (file-name-base file)))
-          (names '("cover" "folder" "front" "album" "albumart")))
-      (when (file-directory-p directory)
-        (cl-find-if
-         (lambda (candidate)
-           (and (member (downcase (file-name-base candidate))
-                        (cons base names))
-                (string-match-p "\\.\\(?:jpe?g\\|png\\|webp\\|gif\\)\\'"
-                                candidate)))
-         (directory-files directory t))))))
-
-(defun bongo-player--embedded-cover (key)
-  "Extract cover art embedded in the track described by KEY, or nil."
-  (let* ((file (nth 0 key))
-         (cache (expand-file-name
-                 (concat (md5 (format "%S" key)) ".png")
-                 bongo-player-cover-directory)))
-    (cond
-     ((file-readable-p cache)
-      cache)
-     ((and (stringp file)
-           (file-readable-p file)
-           (not (bongo-uri-p file))
-           (executable-find bongo-player-ffmpeg-program))
-      (make-directory (file-name-directory cache) t)
-      (when (zerop (or (ignore-errors
-                         (call-process bongo-player-ffmpeg-program
-                                       nil nil nil
-                                       "-y" "-v" "error"
-                                       "-i" file
-                                       "-map" "0:v" "-map" "-0:V"
-                                       "-frames:v" "1"
-                                       cache))
-                       1))
-        (and (file-readable-p cache) cache))))))
-
-(defun bongo-player--cover-file (key)
-  "Return a cover image file for the track described by KEY, or nil."
-  (and key
-       (or (bongo-player--local-cover (nth 0 key))
-           (bongo-player--embedded-cover key))))
-
-(defun bongo-player--create-cover (file)
-  "Return a cover image object for FILE, or nil."
-  (when file
-    (ignore-errors
-      (create-image file nil nil
-                    :max-width bongo-player-cover-max-size
-                    :max-height bongo-player-cover-max-size
-                    :ascent 'center))))
-
-(defun bongo-player--load-cover (track)
-  "Find and load the cover for the track described by TRACK."
-  (setq bongo-player--cover-file nil
-        bongo-player--cover nil)
-  (when (and bongo-player-show-cover track)
-    (let ((file (bongo-player--cover-file track)))
-      (when file
-        (setq bongo-player--cover-file file
-              bongo-player--cover (bongo-player--create-cover file))))))
+  "Return the player mode line construct.
+The progress bar is a canvas image; the elapsed and total time are
+right-aligned after it."
+  (let* ((time (bongo-player--progress-label))
+         (time-width (bongo-player--string-pixel-width time 'mode-line)))
+    (concat
+     " "
+     (when (and bongo-player-progress-bar bongo-player--progress-canvas)
+       (propertize " " 'display bongo-player--progress-canvas
+                   'help-echo "Playback position"))
+     (propertize " " 'display
+                 `(space :align-to (- right (,(+ time-width 4)))))
+     time
+     " ")))
 
 
 ;;;; Visualizer
@@ -401,133 +357,282 @@ when the player is turned off."
     (bongo-visualizer-mode 1)))
 
 
-;;;; The progress bar
+;;;; The header line buttons
 
-(defconst bongo-player--progress-blocks
-  ["\u258f" "\u258e" "\u258d" "\u258c" "\u258b" "\u258a" "\u2589" "\u2588"]
-  "Fractional block characters used to draw the progress bar.")
+(defvar bongo-player-header-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'bongo-player-header-click)
+    (define-key map [header-line down-mouse-1] #'ignore)
+    map)
+  "Keymap used on the buttons in the player header line.")
 
-(defun bongo-player--progress-columns ()
-  "Return the width in columns of the progress bar."
-  (or bongo-player-progress-width
-      (let ((window (bongo-player--window)))
-        (and window (max 8 (- (window-body-width window) 16))))
-      40))
+(defun bongo-player-header-click (event)
+  "Invoke the header line button clicked with EVENT."
+  (interactive "e")
+  (let* ((start (event-start event))
+         (object (posn-object start))
+         (action (cond
+                  ((consp object)
+                   (get-text-property (cdr object)
+                                      'bongo-player-action
+                                      (car object)))
+                  ((integer-or-marker-p (posn-point start))
+                   (with-current-buffer (window-buffer (posn-window start))
+                     (get-char-property (posn-point start)
+                                        'bongo-player-action))))))
+    (when (commandp action)
+      (call-interactively action))))
 
-(defun bongo-player--progress-string ()
-  "Return the progress line: a text bar and the elapsed/total time."
-  (let* ((player (bongo-lyrics-live-player))
-         (total (bongo-lyrics-total-time))
-         (elapsed (bongo-lyrics-elapsed-time))
-         (index (bongo-lyrics-current-index))
-         (entries (bongo-lyrics-timed-lines))
-         (width (bongo-player--progress-columns))
-         (has-line (and entries index))
-         (position (cond
-                    ((null player) 0.0)
-                    ((and total (> total 0.0))
-                     (max 0.0 (min 1.0 (/ elapsed total))))
-                    (has-line
-                     (bongo-lyrics-current-fraction))
-                    (t 0.0)))
-         (line-start (if (and has-line total (> total 0.0))
-                         (max 0.0
-                              (min 1.0
-                                   (/ (car (aref entries index)) total)))
-                       0.0))
-         (cells nil))
-    (dotimes (i width)
-      (let* ((low (/ (float i) width))
-             (high (/ (float (1+ i)) width))
-             (middle (/ (+ low high) 2.0))
-             (fill (max 0.0 (min 1.0 (/ (- position low) (- high low)))))
-             (face (cond
-                    ((<= fill 0.0) 'bongo-player-progress-empty)
-                    ((and has-line (>= middle line-start))
-                     'bongo-player-progress-current)
-                    (t 'bongo-player-progress-track))))
-        (push (propertize
-               (cond
-                ((<= fill 0.0) "\u2591")
-                ((>= fill 1.0) "\u2588")
-                (t (aref bongo-player--progress-blocks
-                         (1- (max 1 (min 8 (ceiling (* fill 8))))))))
-               'face face)
-              cells)))
-    (concat (apply #'concat (nreverse cells))
-            " "
-            (propertize
-             (if (and total (> total 0.0))
-                 (format "%s / %s"
-                         (bongo-format-seconds elapsed)
-                         (bongo-format-seconds total))
-               (bongo-format-seconds elapsed))
-             'face 'bongo-player-info))))
+(defun bongo-player--widget-string (type &rest args)
+  "Render widget TYPE with ARGS and return it as a string.
+Widgets store their faces, help and button properties in overlays,
+which a header line cannot display, so the properties that matter
+are copied over to text properties."
+  (with-temp-buffer
+    (apply #'widget-create type args)
+    (widget-setup)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (dolist (overlay (overlays-in (point-min) (point-max)))
+        (let ((start (- (overlay-start overlay) (point-min)))
+              (end (- (overlay-end overlay) (point-min))))
+          (dolist (property '(face mouse-face help-echo))
+            (let ((value (overlay-get overlay property)))
+              (when value
+                (add-text-properties start end
+                                     (list property value)
+                                     text))))))
+      text)))
+
+(defun bongo-player--header-button (label action &optional help)
+  "Return a header line button string labelled LABEL for ACTION.
+HELP is the tooltip shown when the mouse is over the button."
+  (let ((text (bongo-player--widget-string
+               'push-button
+               :notify (lambda (&rest _) (call-interactively action))
+               :help-echo help
+               label)))
+    (add-text-properties 0 (length text)
+                         (list 'keymap bongo-player-header-map
+                               'pointer 'hand
+                               'bongo-player-action action)
+                         text)
+    text))
+
+(defun bongo-player--header-buttons ()
+  "Return the button string shown on the right of the header line."
+  (or bongo-player--header-buttons
+      (setq bongo-player--header-buttons
+            (mapconcat
+             #'identity
+             (list
+              (bongo-player--header-button
+               " -0.5s " #'bongo-lyrics-offset-earlier
+               "Make the lyrics appear earlier")
+              (bongo-player--header-button
+               " +0.5s " #'bongo-lyrics-offset-later
+               "Make the lyrics appear later")
+              (bongo-player--header-button
+               " 0 " #'bongo-lyrics-reset-offset
+               "Reset the lyrics offset")
+              (bongo-player--header-button
+               " Load file " #'bongo-lyrics-load-file
+               "Pick a lyrics file")
+              (bongo-player--header-button
+               " Reload " #'bongo-lyrics-reload
+               "Reload the lyrics")
+              (bongo-player--header-button
+               " Forget " #'bongo-lyrics-forget
+               "Forget the cached lyrics"))
+             " "))))
+
+(defun bongo-player--header-line ()
+  "Return the header line construct for the player buffer.
+The track title is shown on the left and the widget buttons are
+right-aligned.  The title is truncated when the window is too
+narrow to hold both."
+  (let* ((window (bongo-player--window))
+         (frame (if window (window-frame window) (selected-frame)))
+         (available (if window (window-body-width window t) 400))
+         (right (bongo-player--header-buttons))
+         (right-width (bongo-player--string-pixel-width right 'header-line))
+         (left (concat
+                " "
+                (propertize (let ((title (bongo-lyrics-title)))
+                              (if (string-empty-p title)
+                                  "Bongo Player"
+                                title))
+                            'face 'bongo-player-title)))
+         (left (truncate-string-pixelwise
+                left (max 0 (- available right-width 8
+                               (frame-char-width frame)))
+                (bongo-player--buffer) "\u2026")))
+    (concat left
+            (propertize " " 'display
+                        `(space :align-to (- right (,(+ right-width 8)))))
+            right
+            " ")))
+
+
+;;;; The mode line progress bar
+
+(defun bongo-player--progress-height ()
+  "Return the pixel height of the mode line progress canvas."
+  (let* ((window (bongo-player--window))
+         (height (and window
+                      (fboundp 'window-mode-line-height)
+                      (window-mode-line-height window))))
+    (or (and (integerp bongo-player-progress-height)
+             (> bongo-player-progress-height 1)
+             bongo-player-progress-height)
+        (and (integerp bongo-visualizer-mode-line-height)
+             (> bongo-visualizer-mode-line-height 1)
+             bongo-visualizer-mode-line-height)
+        (and (integerp height) (> height 1) height)
+        (frame-char-height (if window
+                               (window-frame window)
+                             (selected-frame))))))
+
+(defun bongo-player--progress-width ()
+  "Return the pixel width of the mode line progress canvas."
+  (let* ((window (bongo-player--window))
+         (frame (if window (window-frame window) (selected-frame)))
+         (char-width (max 1 (frame-char-width frame)))
+         (available (if window (window-body-width window t) 400))
+         (time (bongo-player--progress-label))
+         (time-width (bongo-player--string-pixel-width time 'mode-line))
+         ;; Room for the spaces around the bar, the time and a margin.
+         (reserved (+ (* 3 char-width) time-width 6)))
+    (max 40 (- available reserved))))
+
+(defun bongo-player--face-color (face attribute &optional alpha)
+  "Return FACE's ATTRIBUTE color packed into ARGB32.
+ATTRIBUTE is a face attribute such as :foreground or :background.
+ALPHA is the alpha byte of the packed color, opaque by default."
+  (let ((color (face-attribute face attribute nil t)))
+    (if (stringp color)
+        (let ((values (color-values color)))
+          (if values
+              (bongo-visualizer--argb
+               (/ (float (nth 0 values)) 257.0)
+               (/ (float (nth 1 values)) 257.0)
+               (/ (float (nth 2 values)) 257.0)
+               alpha)
+            #xffffffff))
+      #xffffffff)))
+
+(defun bongo-player--mode-line-face ()
+  "Return the mode line face used by the player window."
+  (let ((window (bongo-player--window)))
+    (if (and window (eq window (selected-window)))
+        'mode-line
+      'mode-line-inactive)))
+
+(defun bongo-player--create-progress-canvas (width height)
+  "Create the mode line progress canvas of WIDTH by HEIGHT pixels."
+  (when bongo-player--progress-canvas
+    (image-flush bongo-player--progress-canvas t))
+  (let ((data (make-vector (* width height)
+                           (bongo-visualizer--argb 0 0 0 0))))
+    (setq bongo-player--progress-canvas
+          (create-image data 'canvas t
+                        :data-width width
+                        :data-height height
+                        :ascent 'center)
+          bongo-player--progress-canvas-width width
+          bongo-player--progress-canvas-height height
+          bongo-player--progress-data
+          (plist-get (cdr bongo-player--progress-canvas) :data))))
+
+(defun bongo-player--paint-progress-canvas ()
+  "Paint the current playback position into the progress canvas."
+  (let* ((data bongo-player--progress-data)
+         (width bongo-player--progress-canvas-width)
+         (height bongo-player--progress-canvas-height))
+    (when (and data width height)
+      (let* ((player (bongo-lyrics-live-player))
+             (total (bongo-lyrics-total-time))
+             (elapsed (or (bongo-lyrics-elapsed-time) 0.0))
+             (index (bongo-lyrics-current-index))
+             (entries (bongo-lyrics-timed-lines))
+             (has-line (and entries index
+                            (>= index 0)
+                            (< index (length entries))))
+             (position (cond
+                        ((null player) 0.0)
+                        ((and total (> total 0.0))
+                         (max 0.0 (min 1.0 (/ elapsed total))))
+                        (has-line
+                         (bongo-lyrics-current-fraction))
+                        (t 0.0)))
+             (line-start (if (and has-line total (> total 0.0))
+                             (max 0.0
+                                  (min 1.0
+                                       (/ (car (aref entries index))
+                                          total)))
+                           0.0))
+             (empty (bongo-player--face-color 'bongo-player-progress-empty
+                                              :foreground #x60))
+             (track (bongo-player--face-color 'bongo-player-progress-track
+                                              :foreground))
+             (current (bongo-player--face-color
+                       'bongo-player-progress-current :foreground))
+             (background (bongo-player--face-color
+                          (bongo-player--mode-line-face) :background))
+             (thickness (max 2 (min 8 (/ height 4))))
+             (top (max 0 (/ (- height thickness) 2)))
+             (head (min (1- width) (round (* position (1- width))))))
+        (fillarray data background)
+        (dotimes (x width)
+          (let* ((fraction (/ (float x) (max 1 (1- width))))
+                 (color (cond
+                         ((<= fraction position)
+                          (if (and has-line (>= fraction line-start))
+                              current
+                            track))
+                         (t empty))))
+            (dotimes (dy thickness)
+              (aset data (+ (* (+ top dy) width) x) color))))
+        (when (and (> position 0.0) (< position 1.0))
+          (let ((from (max 0 (- top 2)))
+                (to (min (1- height) (+ top thickness 1))))
+            (while (< from to)
+              (aset data (+ (* from width) head) current)
+              (setq from (1+ from)))))))))
 
 (defun bongo-player--update-progress ()
-  "Redraw the progress line in place."
-  (let ((inhibit-read-only t)
-        (start (and (markerp bongo-player--progress-start)
-                    (marker-position bongo-player--progress-start)))
-        (end (and (markerp bongo-player--progress-end)
-                  (marker-position bongo-player--progress-end))))
-    (when (and start end (<= start end))
-      (save-excursion
-        (delete-region start end)
-        (goto-char start)
-        (insert (bongo-player--progress-string))
-        (set-marker bongo-player--progress-end (point)
-                    bongo-player--buffer)))))
-
-(defun bongo-player--insert-controls ()
-  "Insert the widget control row."
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (bongo-lyrics-offset-earlier))
-                 " -0.5s ")
-  (insert " ")
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (bongo-lyrics-offset-later))
-                 " +0.5s ")
-  (insert " ")
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (bongo-lyrics-reset-offset))
-                 " 0 ")
-  (insert "  ")
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (call-interactively #'bongo-lyrics-load-file))
-                 " Load file ")
-  (insert " ")
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (bongo-lyrics-reload))
-                 " Reload ")
-  (insert " ")
-  (widget-create 'push-button
-                 :notify (lambda (&rest _)
-                           (bongo-lyrics-forget))
-                 " Forget ")
-  (widget-setup))
+  "Resize and repaint the mode line progress canvas when needed."
+  (if (not (and bongo-player-progress-bar
+                (bongo-player--buffer)
+                (bongo-player--window)))
+      (when bongo-player--progress-canvas
+        (image-flush bongo-player--progress-canvas t)
+        (setq bongo-player--progress-canvas nil
+              bongo-player--progress-data nil
+              bongo-player--progress-canvas-width nil
+              bongo-player--progress-canvas-height nil))
+    (let ((width (bongo-player--progress-width))
+          (height (bongo-player--progress-height)))
+      (when (or (null bongo-player--progress-canvas)
+                (/= width (or bongo-player--progress-canvas-width 0))
+                (/= height (or bongo-player--progress-canvas-height 0)))
+        (bongo-player--create-progress-canvas width height))
+      (bongo-player--paint-progress-canvas)
+      (canvas-refresh bongo-player--progress-canvas 'reload-data))))
 
 
 ;;;; Rendering
 
 (defun bongo-player--render-header ()
-  "Redraw the header of the player buffer."
-  (let ((inhibit-read-only t))
+  "Redraw the body header of the player buffer.
+The title and the buttons live in the header line; here we only
+insert the track information and the visualizer canvas."
+  (let ((inhibit-read-only t)
+        (start (if (marker-position bongo-player--header-end)
+                   (marker-position bongo-player--header-end)
+                 (point-min))))
     (goto-char (point-min))
-    (delete-region (point-min)
-                   (if (marker-position bongo-player--header-end)
-                       (marker-position bongo-player--header-end)
-                     (point-min)))
+    (delete-region (point-min) start)
     (goto-char (point-min))
-    (insert (propertize (let ((title (bongo-lyrics-title)))
-                          (if (string-empty-p title) "Bongo Player" title))
-                        'face 'bongo-player-title))
-    (insert "\n")
     (let ((info (string-join
                  (delq nil (list (nth 1 bongo-player--last-track)
                                  (nth 3 bongo-player--last-track)))
@@ -535,22 +640,11 @@ when the player is turned off."
       (unless (string-empty-p info)
         (insert (propertize info 'face 'bongo-player-info))
         (insert "\n")))
-    (let ((cover bongo-player--cover)
-          (canvas bongo-player--canvas))
-      (when (or cover canvas)
-        (when cover
-          (insert-image cover " "))
-        (when (and cover canvas)
-          (insert "   "))
-        (when canvas
-          (insert (propertize " " 'display canvas)))
-        (insert "\n")))
-    (set-marker bongo-player--progress-start (point))
-    (insert (bongo-player--progress-string))
-    (set-marker bongo-player--progress-end (point) bongo-player--buffer)
+    (when bongo-player--canvas
+      (insert " ")
+      (insert (propertize " " 'display bongo-player--canvas))
+      (insert "\n"))
     (insert "\n")
-    (bongo-player--insert-controls)
-    (insert "\n\n")
     (set-marker bongo-player--header-end (point) bongo-player--buffer)
     (set-marker bongo-player--lyrics-start (point) bongo-player--buffer)))
 
@@ -699,7 +793,6 @@ When CURRENT is non-nil, highlight the line."
                   (not (equal track bongo-player--last-track)))
           (setq bongo-player--dirty nil
                 bongo-player--last-track track)
-          (bongo-player--load-cover track)
           (bongo-player--render-header)
           (bongo-player--render-lyrics)
           (setq bongo-player--rendered-index index))
@@ -747,8 +840,6 @@ When CURRENT is non-nil, highlight the line."
       (erase-buffer))
     (setq-local mode-line-format '(:eval (bongo-player--mode-line)))
     (setq bongo-player--header-end (copy-marker (point-min)))
-    (setq bongo-player--progress-start (copy-marker (point-min)))
-    (setq bongo-player--progress-end (copy-marker (point-min)))
     (setq bongo-player--lyrics-start (copy-marker (point-min)))
     (setq bongo-player--spacer nil
           bongo-player--spacer-height nil
@@ -767,30 +858,33 @@ When CURRENT is non-nil, highlight the line."
   "Remove the player buffer and its window."
   (when (window-live-p bongo-player--window)
     (ignore-errors (delete-window bongo-player--window)))
+  (when bongo-player--progress-canvas
+    (image-flush bongo-player--progress-canvas t))
   (let ((buffer (bongo-player--buffer)))
     (when buffer
       (kill-buffer buffer)))
   (setq bongo-player--buffer nil
         bongo-player--window nil
         bongo-player--header-end nil
-        bongo-player--progress-start nil
-        bongo-player--progress-end nil
         bongo-player--lyrics-start nil
+        bongo-player--progress-canvas nil
+        bongo-player--progress-data nil
+        bongo-player--progress-canvas-width nil
+        bongo-player--progress-canvas-height nil
         bongo-player--spacer nil
         bongo-player--spacer-height nil
         bongo-player--spacer-value nil
         bongo-player--current-line nil
         bongo-player--rendered-index nil
         bongo-player--last-track nil
-        bongo-player--cover-file nil
-        bongo-player--cover nil
         bongo-player--dirty t))
 
 ;;;###autoload
 (define-minor-mode bongo-player-mode
   "Toggle the Bongo player buffer.
-The buffer shows the album cover, the visualizer, a progress bar and
-scrolling lyrics for the track that Bongo is playing.  This is a
+The buffer shows the track title and widget buttons in its header
+line, the visualizer, scrolling lyrics, and a canvas progress bar
+in its mode line for the track that Bongo is playing.  This is a
 global minor mode; it follows whichever Bongo playlist buffer
 currently has an active player."
   :global t
