@@ -34,6 +34,10 @@
 ;;     image with the elapsed and total time.  The progress bar is
 ;;     buffer-local, so it only appears in the player buffer.
 ;;
+;; The player buffer is shown in the selected window rather than in a
+;; new one, and disabling the mode restores the buffer that was there
+;; before.
+;;
 ;; Widget buttons need buffer text to live in, which a header line
 ;; cannot provide; they are rendered with the widget faces and their
 ;; clicks are dispatched through a keymap attached to the header line.
@@ -114,13 +118,6 @@
   :type 'string
   :group 'bongo-player)
 
-(defcustom bongo-player-window-height 26
-  "Height in lines of the player window.
-Make this large enough for the header (visualizer and progress bar)
-plus `bongo-player-lyrics-lines' lyric lines."
-  :type 'integer
-  :group 'bongo-player)
-
 (defcustom bongo-player-lyrics-lines 7
   "Number of lyric lines shown in the player buffer."
   :type 'integer
@@ -158,6 +155,9 @@ and to the natural height of the mode line when that is nil too."
 
 (defvar bongo-player--window nil
   "Window displaying the player buffer, or nil.")
+
+(defvar bongo-player--previous-buffer nil
+  "Buffer shown in the player window before the player buffer, or nil.")
 
 (defvar bongo-player--header-end nil
   "Marker at the end of the player header.")
@@ -834,7 +834,7 @@ When CURRENT is non-nil, highlight the line."
 ;;;; The global minor mode
 
 (defun bongo-player--setup-buffer ()
-  "Create and display the player buffer."
+  "Create the player buffer and show it in the selected window."
   (setq bongo-player--buffer (get-buffer-create bongo-player-buffer-name))
   (with-current-buffer bongo-player--buffer
     (unless (derived-mode-p 'bongo-player-view-mode)
@@ -849,24 +849,30 @@ When CURRENT is non-nil, highlight the line."
           bongo-player--spacer-value nil
           bongo-player--current-line nil))
   (unless (bongo-player--window)
+    (setq bongo-player--previous-buffer (window-buffer (selected-window)))
+    (switch-to-buffer bongo-player--buffer)
     (setq bongo-player--window
-          (display-buffer
-           bongo-player--buffer
-           `(display-buffer-at-bottom
-             (window-height . ,bongo-player-window-height)
-             (dedicated . side))))))
+          (or (and (eq (window-buffer (selected-window)) bongo-player--buffer)
+                   (selected-window))
+              (get-buffer-window bongo-player--buffer t)))))
 
 (defun bongo-player--teardown-buffer ()
-  "Remove the player buffer and its window."
-  (when (window-live-p bongo-player--window)
-    (ignore-errors (delete-window bongo-player--window)))
+  "Remove the player buffer and restore the window it was shown in."
   (when bongo-player--progress-canvas
     (image-flush bongo-player--progress-canvas t))
-  (let ((buffer (bongo-player--buffer)))
+  (let ((window bongo-player--window)
+        (previous bongo-player--previous-buffer)
+        (buffer (bongo-player--buffer)))
+    (when (and (window-live-p window)
+               (eq (window-buffer window) buffer))
+      (set-window-buffer window (if (buffer-live-p previous)
+                                    previous
+                                  (other-buffer buffer))))
     (when buffer
       (kill-buffer buffer)))
   (setq bongo-player--buffer nil
         bongo-player--window nil
+        bongo-player--previous-buffer nil
         bongo-player--header-end nil
         bongo-player--lyrics-start nil
         bongo-player--progress-canvas nil
