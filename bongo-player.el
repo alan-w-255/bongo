@@ -141,7 +141,7 @@ The bar is a canvas image and only appears in the player buffer."
 (defcustom bongo-player-progress-height nil
   "Height in pixels of the mode line progress bar.
 A value of nil falls back to `bongo-visualizer-mode-line-height',
-and to the height of the mode line when that is nil too."
+and to the natural height of the mode line when that is nil too."
   :type '(choice (const :tag "Mode line height" nil) integer)
   :group 'bongo-player)
 
@@ -179,6 +179,11 @@ and to the height of the mode line when that is nil too."
 
 (defvar bongo-player--progress-canvas-height nil
   "Height in pixels of `bongo-player--progress-canvas'.")
+
+(defvar bongo-player--base-mode-line-height nil
+  "Natural pixel height of the player mode line.
+It is measured before the progress canvas is installed, so that the
+canvas cannot feed its own height back into the mode line.")
 
 (defvar bongo-player--spacer nil
   "Marker on the newline of the first rendered lyric line.")
@@ -466,21 +471,29 @@ narrow to hold both."
 ;;;; The mode line progress bar
 
 (defun bongo-player--progress-height ()
-  "Return the pixel height of the mode line progress canvas."
-  (let* ((window (bongo-player--window))
-         (height (and window
-                      (fboundp 'window-mode-line-height)
-                      (window-mode-line-height window))))
+  "Return the pixel height of the mode line progress canvas.
+The height of the mode line is measured once, while it does not yet
+hold the progress canvas, and then cached.  Measuring the rendered
+mode line on every update would feed the canvas height back into the
+mode line, which would grow a little on each update."
+  (let ((window (bongo-player--window)))
+    (unless bongo-player--base-mode-line-height
+      (setq bongo-player--base-mode-line-height
+            (or (and window
+                     (fboundp 'window-mode-line-height)
+                     (let ((height (window-mode-line-height window)))
+                       (and (integerp height) (> height 1) height)))
+                (ignore-errors (bongo-face-height 'mode-line))
+                (frame-char-height (if window
+                                       (window-frame window)
+                                     (selected-frame))))))
     (or (and (integerp bongo-player-progress-height)
              (> bongo-player-progress-height 1)
              bongo-player-progress-height)
         (and (integerp bongo-visualizer-mode-line-height)
              (> bongo-visualizer-mode-line-height 1)
              bongo-visualizer-mode-line-height)
-        (and (integerp height) (> height 1) height)
-        (frame-char-height (if window
-                               (window-frame window)
-                             (selected-frame))))))
+        bongo-player--base-mode-line-height)))
 
 (defun bongo-player--progress-width ()
   "Return the pixel width of the mode line progress canvas."
@@ -860,6 +873,7 @@ When CURRENT is non-nil, highlight the line."
         bongo-player--progress-data nil
         bongo-player--progress-canvas-width nil
         bongo-player--progress-canvas-height nil
+        bongo-player--base-mode-line-height nil
         bongo-player--spacer nil
         bongo-player--spacer-height nil
         bongo-player--spacer-value nil
